@@ -1,0 +1,22 @@
+[package]
+name = "youtube-audio-rss"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "1.25.0", features = ["full"] }
+async-process = "1.6.0"
+hyper = { version = "0.14.24", features = ["full"] }
+hyper-tls = "0.5.0"
+
+anyhow = "1.0.69"
+
+atom_syndication = "0.12.0"
+
+google-youtube3 = "4.0.1"
+
+rusqlite = { version = "0.28.0", features = ["bundled", "chrono"] }
+
+chrono = "0.4.23"
