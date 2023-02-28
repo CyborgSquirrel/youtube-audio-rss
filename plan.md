@@ -48,3 +48,39 @@ Ideally, I would have my own domain, and use that. Otherwise, I could
 also use the same host that was used to make the request for the rss
 feed (although that would mean that the feed will change anytime the
 host changes, which seems undesirable).
+
+# Notes
+
+Wanna try to use youtube api, instead of the channels' rss feeds. I have
+to request and store all the video ids.
+
+The plan is:
+
+- when you get a request for an rss feed:
+	- if that channel is not in the db, then:
+		- make a request for that channel, and add it to the db
+	- if you haven't received a request for that feed in the last
+	15 minutes, then:
+		- update the videos of the feed's channel
+		- to do this, request all videos from newest to oldest,
+		page by page
+		- add all the videos from the response into the db
+		- whenever the response contains a video that is already
+		in the db, stop the requests
+	- generate the feed and return it
+
+Channel
+	- `id`
+	- `name`
+	- `description`
+	- `image_url`
+	- has all video information been downloaded when first accessed?
+
+to get video thumbnail: `https://i.ytimg.com/vi/{video_id}/hq720.jpg`
+
+Video
+	- `id`
+	- `channel_id`
+	- `published_date`
+	- `name`
+	- `description`
