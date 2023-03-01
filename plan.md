@@ -84,3 +84,14 @@ Video
 	- `published_date`
 	- `name`
 	- `description`
+
+# Notes 2
+
+Set a limit on the amount of bytes the audio cache can take up. 500MB
+
+When to delete audio files from the cache?
+
+After you download a file, count the total amount of bytes all the audio
+files are currently taking up. If it's greater than the limit, delete
+the least-recently-accessed ones, one by one, until the total is under
+the limit.

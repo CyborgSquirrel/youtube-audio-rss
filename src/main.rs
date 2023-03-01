@@ -1,360 +1,69 @@
-// async fn get_channel_id_from_username<T: AsRef<str>>(username: T) {
-// 	let secret: google_youtube3::oauth2::ApplicationSecret = google_youtube3::oauth2::
-	
-// 	let mut hub = google_youtube3::YouTube::new(
-// 		hyper::Client::builder()
-// 			.build(
-// 				google_youtube3::hyper_rustls::HttpsConnectorBuilder::new()
-// 					.with_native_roots()
-// 					.https_or_http()
-// 					.enable_http1()
-// 					.enable_http2()
-// 					.build()), auth);
-// }
+use std::{collections::{HashMap, BTreeMap}, str::FromStr, ffi::{OsStr, OsString}, any, io::Read};
+
+use clap::Parser;
+use lazy_static::lazy_static;
+use rusqlite::OptionalExtension;
 
 #[derive(Debug, clap::Parser)]
 struct Args {
+	#[arg(long)]
 	youtube_secret_path: std::path::PathBuf,
+	#[arg(long)]
+	working_dir: std::path::PathBuf,
+}
+
+lazy_static! {
+	static ref AUDIO_CACHE_PATH: &'static std::path::Path = std::path::Path::new("audio_cache");
+	static ref AUDIO_TMP_PATH: &'static std::path::Path = std::path::Path::new("audio_tmp");
+}
+
+struct AppConfig {
+	domain: String,
+	audio_cache_size: u64,
+	youtube_update_delay: chrono::Duration,
 }
 
 fn prefixed<'a>(prefix: &'a str, local_name: &'a str) -> xml::name::Name<'a> {
 	xml::name::Name::prefixed(local_name, prefix)
 }
 
-async fn get_feed_from_channel_id<T: AsRef<str>>(channel_id: T) -> String {
-	// TODO: Maybe add some of the following tags:
-	// itunes:author
-	// itunes:duration
-	// itunes:explicit
-	
-	let channel_id = channel_id.as_ref();
-	
-	let rss_url = hyper::Uri::builder()
-		.scheme("https")
-		.authority("www.youtube.com")
-		.path_and_query(format!("/feeds/videos.xml?channel_id={channel_id}"))
-		.build().unwrap();
-	
-	let https = hyper_rustls::HttpsConnectorBuilder::new()
-		.with_native_roots()
-		.https_only()
-		.enable_http1()
-		.enable_http2()
-		.build();
-	
-	let client = hyper::client::Client::builder().build::<_, hyper::Body>(https);
-	let res = client.get(rss_url).await.unwrap();
-	
-	let body_bytes = hyper::body::to_bytes(res.into_body()).await.unwrap();
-	let body_bytes = body_bytes.as_ref();
-	
-	let writer_inner = Vec::new();
-	
-	let mut reader = xml::EventReader::new(body_bytes);
-	let mut writer = xml::EventWriter::new(writer_inner);
-	
-	writer.write(
-		xml::writer::XmlEvent::start_element("rss")
-			.attr(prefixed("xmlns", "dc"     ), "http://purl.org/dc/elements/1.1/"            )
-			.attr(prefixed("xmlns", "sy"     ), "http://purl.org/rss/1.0/modules/syndication/")
-			.attr(prefixed("xmlns", "admin"  ), "http://webns.net/mvcb/"                      )
-			.attr(prefixed("xmlns", "atom"   ), "http://www.w3.org/2005/Atom/"                )
-			.attr(prefixed("xmlns", "rdf"    ), "http://www.w3.org/1999/02/22-rdf-syntax-ns#" )
-			.attr(prefixed("xmlns", "content"), "http://purl.org/rss/1.0/modules/content/"    )
-			.attr(prefixed("xmlns", "itunes" ), "http://www.itunes.com/dtds/podcast-1.0.dtd"  )
-			.attr(xml::name::Name::local("version"), "2.0")
-	).unwrap();
-	
-	writer.write(
-		xml::writer::XmlEvent::start_element("channel")
-	).unwrap();
-	
-	let mut tree = Vec::new();
-	while let Ok(event) = reader.next() {
-		match event {
-			xml::reader::XmlEvent::EndDocument => {
-				break;
-			}
-			xml::reader::XmlEvent::StartElement { name, attributes, .. } => {
-				tree.push(name);
-				
-				let tree: Vec<_> = tree.iter().map(|name| name.borrow().local_name).collect();
-				let tree = tree.as_slice();
-				match tree {
-					[ "feed" ] => {
-						writer.write(
-							xml::writer::XmlEvent::start_element("description")
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::characters("dingus description")
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::end_element()
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::start_element("itunes:block")
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::characters("no")
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::end_element()
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::start_element("itunes:image")
-								.attr(xml::name::Name::local("href"), "https://yt3.googleusercontent.com/AiO15WuxEOHj2ADa3v9X9euz4MHEzCNZ7XY05JOQUSffoNT4hvWs-dhdZmbkmMlpp5RsnWcorg=s176-c-k-c0x00ffffff-no-rj")
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::end_element()
-						).unwrap();
-					}
-					[ "feed", "entry" ] => {
-						writer.write(
-							xml::writer::XmlEvent::start_element("item")
-						).unwrap();
-					}
-					[ "feed", "entry", "link" ] => {
-						let href = attributes.iter()
-							.map(|attribute| attribute.borrow())
-							.find(|attribute| attribute.name.local_name == "href")
-							.unwrap()
-							.value;
-						
-						let href_uri = hyper::Uri::from_str(href).unwrap();
-						let video_id =
-							href_uri.query()
-								.map(|query| query.split("&")
-									.map(|key_value| key_value.split_once("=").unwrap())
-									.find(|(key, _)| *key == "v")
-									.map(|(_, value)| value)).unwrap().unwrap();
-						
-						let enclosure_href = format!("http://192.168.1.8:3000/audio/{video_id}.mp3");
-						
-						writer.write(
-							xml::writer::XmlEvent::start_element("enclosure")
-								.attr(xml::name::Name::local("url"), enclosure_href.as_str())
-								// TODO: maybe try to determine the length
-								.attr(xml::name::Name::local("length"), "0")
-								.attr(xml::name::Name::local("type"), "audio/mp3")
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::end_element()
-						).unwrap();
-					}
-					[ "feed", "entry", "group", "thumbnail" ] => {
-						let url = attributes.iter()
-							.map(|attribute| attribute.borrow())
-							.find(|attribute| attribute.name.local_name == "url")
-							.unwrap()
-							.value;
-						
-						// writer.write(
-						// 	xml::writer::XmlEvent::start_element("itunes:image")
-						// 		.attr(xml::name::Name::local("href"), url)
-						// ).unwrap();
-						
-						// writer.write(
-						// 	xml::writer::XmlEvent::end_element()
-						// ).unwrap();
-					}
-					_ => { }
-				}
-			}
-			xml::reader::XmlEvent::EndElement { .. } => {
-				let other_tree: Vec<_> = tree.iter().map(|name| name.borrow().local_name).collect();
-				let other_tree = other_tree.as_slice();
-				
-				match other_tree {
-					[ "feed", "entry" ] => {
-						writer.write(
-							xml::writer::XmlEvent::end_element()
-						).unwrap();
-					}
-					_ => { }
-				}
-				
-				tree.pop();
-			}
-			xml::reader::XmlEvent::Characters(characters) => {
-				let tree: Vec<_> = tree.iter().map(|name| name.borrow().local_name).collect();
-				let tree = tree.as_slice();
-				match tree {
-					[ "feed", "title" ] => {
-						writer.write(
-							xml::writer::XmlEvent::start_element("title")
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::characters(characters.as_str())
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::end_element()
-						).unwrap();
-					}
-					[ "feed", "entry", "title" ] => {
-						writer.write(
-							xml::writer::XmlEvent::start_element("title")
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::characters(characters.as_str())
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::end_element()
-						).unwrap();
-					}
-					[ "feed", "entry", "group", "description" ] => {
-						writer.write(
-							xml::writer::XmlEvent::start_element("description")
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::characters(characters.as_str())
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::end_element()
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::start_element("itunes:subtitle")
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::characters(characters.as_str())
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::end_element()
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::start_element("itunes:summary")
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::characters(characters.as_str())
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::end_element()
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::start_element("content:encoded")
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::cdata("dingus content")
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::end_element()
-						).unwrap();
-					}
-					[ "feed", "entry", "id" ] => {
-						writer.write(
-							xml::writer::XmlEvent::start_element("guid")
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::characters(characters.as_str())
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::end_element()
-						).unwrap();
-					}
-					[ "feed", "entry", "published" ] => {
-						writer.write(
-							xml::writer::XmlEvent::start_element("pubDate")
-						).unwrap();
-						
-						let published = chrono::DateTime::parse_from_rfc3339(characters.as_str()).unwrap();
-						let published = published.to_rfc2822();
-						writer.write(
-							xml::writer::XmlEvent::characters(published.as_str())
-						).unwrap();
-						
-						writer.write(
-							xml::writer::XmlEvent::end_element()
-						).unwrap();
-					}
-					_ => { }
-				}
-			}
-			_ => { }
-		}
-	}
-	
-	// channel
-	writer.write(
-		xml::writer::XmlEvent::end_element()
-	).unwrap();
-	
-	// rss
-	writer.write(
-		xml::writer::XmlEvent::end_element()
-	).unwrap();
-	
-	let idk = writer.into_inner();
-	let kdi = std::str::from_utf8(idk.as_slice()).unwrap();
-	
-	String::from(kdi)
+trait EventWriterExt {
+	fn nest<'a, F>(
+		&mut self,
+		start_element: xml::writer::events::StartElementBuilder,
+		add_elements: F,
+	) -> xml::writer::Result<()>
+	where
+		F: FnOnce(&mut Self) -> xml::writer::Result<()>
+	;
 }
 
-use std::{collections::{HashMap, BTreeMap}, str::FromStr, ffi::OsStr, any, io::Read};
-
-use clap::Parser;
-use rusqlite::OptionalExtension;
-
-
-mod audio {
-	pub enum State {
-		NotDownloaded,
-		Downloading,
-		Downloaded,
-	}
-	impl rusqlite::types::FromSql for State {
-		fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-			let value = value.as_i64()?;
-			match value {
-				0 => Ok(State::NotDownloaded),
-				1 => Ok(State::Downloading),
-				2 => Ok(State::Downloaded),
-				_ => Err(rusqlite::types::FromSqlError::InvalidType),
-			}
-		}
-	}
-	impl rusqlite::ToSql for State {
-		fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-			match self {
-				State::NotDownloaded => Ok(0.into()),
-				State::Downloading => Ok(1.into()),
-				State::Downloaded => Ok(2.into()),
-			}
-		}
+impl<W: std::io::Write> EventWriterExt for xml::writer::EventWriter<W> {
+	fn nest<'a, F>(
+		&mut self,
+		start_element: xml::writer::events::StartElementBuilder,
+		add_elements: F,
+	) -> xml::writer::Result<()>
+	where
+		F: FnOnce(&mut Self) -> xml::writer::Result<()>
+	{
+		self.write(start_element)?;
+		add_elements(self)?;
+		self.write(xml::writer::XmlEvent::end_element())?;
+		Ok(())
 	}
 }
 
 struct App {
-	youtube_hub: tokio::sync::Mutex<google_youtube3::YouTube<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>>,
+	config: AppConfig,
+	
+	youtube_hub: google_youtube3::YouTube<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
 	connection: tokio::sync::Mutex<rusqlite::Connection>,
 	audio_thing: tokio::sync::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Notify>>>,
 }
 
 impl App {
-	async fn new(youtube_secret: google_youtube3::oauth2::ServiceAccountKey) -> Self {
+	async fn new(config: AppConfig, youtube_secret: google_youtube3::oauth2::ServiceAccountKey) -> Self {
 		let connection = tokio::sync::Mutex::new(
 			rusqlite::Connection::open("data.db").unwrap());
 		let audio_thing = tokio::sync::Mutex::new(
@@ -386,45 +95,285 @@ impl App {
 			CREATE TABLE IF NOT EXISTS Audio
 				( video_id TEXT PRIMARY KEY
 				
-				, accessed_timestamp INTEGER
+				, last_accessed_timestamp INTEGER
 			);
 		").unwrap();
 		
 		let auth = google_youtube3::oauth2::ServiceAccountAuthenticator::builder(
 			youtube_secret
 		).build().await.unwrap();
-		let youtube_hub = tokio::sync::Mutex::new(
-			google_youtube3::YouTube::new(hyper::Client::builder().build(hyper_rustls::HttpsConnectorBuilder::new().with_native_roots().https_or_http().enable_http1().enable_http2().build()), auth));
+		let youtube_hub =
+			google_youtube3::YouTube::new(hyper::Client::builder().build(hyper_rustls::HttpsConnectorBuilder::new().with_native_roots().https_or_http().enable_http1().enable_http2().build()), auth);
 		
 		Self {
+			config,
+			
 			youtube_hub,
 			connection,
 			audio_thing,
 		}
 	}
 	
-	async fn update_channel_data<T: AsRef<str>>(&self, channel_id: T) {
+	async fn get_feed_from_channel_id<T: AsRef<str>>(&self, channel_id: T) -> String {
+		// TODO: Maybe add some of the following tags:
+		// itunes:author
+		// itunes:duration
+		// itunes:explicit
+		
 		let channel_id = channel_id.as_ref();
 		
-		let mut connection = self.connection.lock().await;
-		let youtube_hub = self.youtube_hub.lock().await;
+		self.update_channel_data(channel_id).await;
 		
-		let channel_in_db = {
+		let connection = self.connection.lock().await;
+		
+		struct Channel {
+			name: String,
+			description: String,
+			image_url: String,
+		}
+		
+		let channel = {
 			connection.query_row(
-				"SELECT EXISTS (SELECT 1 FROM Channel WHERE id = ?)",
+				"SELECT name, description, image_url FROM Channel WHERE id = ?",
 				rusqlite::params![channel_id],
-				|row| row.get::<_, bool>(0),
+				|row| Ok(
+					Channel {
+						name: row.get(0)?,
+						description: row.get(1)?,
+						image_url: row.get(2)?}),
 			).unwrap()
 		};
 		
-		if channel_in_db {
-			// Download and save video information, as long as
-			// we don't hit a primary key violation (which means
-			// that we're all updated).
+		struct Video {
+			id: String,
+			name: String,
+			description: String,
+			image_url: String,
+			published_at: chrono::DateTime<chrono::Utc>,
+		}
+		
+		let videos: Vec<_> = {
+			let mut statement = connection.prepare(
+				"SELECT id, name, description, image_url, published_timestamp FROM Video WHERE channel_id = ? ORDER BY published_timestamp"
+			).unwrap();
 			
-			let mut page_token: Option<String> = None;
+			let rows = statement.query_map(
+				rusqlite::params![channel_id],
+				|row| Ok(
+					Video {
+						id: row.get(0)?,
+						name: row.get(1)?,
+						description: row.get(2)?,
+						image_url: row.get(3)?,
+						published_at: row.get(4)?}),
+			).unwrap();
+			
+			rows.collect()
+		};
+		
+		let writer_inner = Vec::new();
+		let mut writer = xml::EventWriter::new(writer_inner);
+		
+		writer.nest(
+			xml::writer::XmlEvent::start_element("rss")
+				.attr(prefixed("xmlns", "dc"     ), "http://purl.org/dc/elements/1.1/"            )
+				.attr(prefixed("xmlns", "sy"     ), "http://purl.org/rss/1.0/modules/syndication/")
+				.attr(prefixed("xmlns", "admin"  ), "http://webns.net/mvcb/"                      )
+				.attr(prefixed("xmlns", "atom"   ), "http://www.w3.org/2005/Atom/"                )
+				.attr(prefixed("xmlns", "rdf"    ), "http://www.w3.org/1999/02/22-rdf-syntax-ns#" )
+				.attr(prefixed("xmlns", "content"), "http://purl.org/rss/1.0/modules/content/"    )
+				.attr(prefixed("xmlns", "itunes" ), "http://www.itunes.com/dtds/podcast-1.0.dtd"  )
+				.attr(xml::name::Name::local("version"), "2.0"),
+			|writer| writer.nest(
+				xml::writer::XmlEvent::start_element("channel"),
+				|writer| {
+					// Metadata
+					writer.nest(
+						xml::writer::XmlEvent::start_element("title"),
+						|writer| writer.write(
+							xml::writer::XmlEvent::characters(&channel.name)
+						)
+					)?;
+					writer.nest(
+						xml::writer::XmlEvent::start_element("description"),
+						|writer| writer.write(
+							xml::writer::XmlEvent::characters(&channel.description)
+						)
+					)?;
+					writer.nest(
+						xml::writer::XmlEvent::start_element("block"),
+						|writer| writer.write(
+							xml::writer::XmlEvent::characters("no")
+						)
+					)?;
+					writer.nest(
+						xml::writer::XmlEvent::start_element("itunes:image")
+							.attr(xml::name::Name::local("href"), &channel.image_url),
+						|_| Ok(())
+					)?;
+					
+					// Items
+					for video in videos {
+						let video = video.unwrap();
+						
+						writer.nest(
+							xml::writer::XmlEvent::start_element("item"),
+							|writer| {
+								let video_id = video.id;
+								
+								writer.nest(
+									xml::writer::XmlEvent::start_element("title"),
+									|writer| writer.write(
+										xml::writer::XmlEvent::characters(&video.name)
+									)
+								)?;
+								
+								writer.nest(
+									xml::writer::XmlEvent::start_element("description"),
+									|writer| writer.write(
+										xml::writer::XmlEvent::characters(&video.description)
+									)
+								)?;
+								
+								writer.nest(
+									xml::writer::XmlEvent::start_element("itunes:subtitle"),
+									|writer| writer.write(
+										xml::writer::XmlEvent::characters(&video.description)
+									)
+								)?;
+								
+								writer.nest(
+									xml::writer::XmlEvent::start_element("itunes:summary"),
+									|writer| writer.write(
+										xml::writer::XmlEvent::characters(&video.description)
+									)
+								)?;
+								
+								// TODO: escape cdata
+								writer.nest(
+									xml::writer::XmlEvent::start_element("content:encoded"),
+									|writer| writer.write(
+										xml::writer::XmlEvent::cdata(&video.description)
+									)
+								)?;
+								
+								writer.nest(
+									xml::writer::XmlEvent::start_element("guid"),
+									|writer| writer.write(
+										xml::writer::XmlEvent::characters(&video_id)
+									)
+								)?;
+								
+								let domain = &self.config.domain;
+								let enclosure_href = format!("http://{domain}:3000/audio/{video_id}.mp3");
+								
+								writer.nest(
+									xml::writer::XmlEvent::start_element("enclosure")
+										.attr(xml::name::Name::local("url"), enclosure_href.as_str())
+										.attr(xml::name::Name::local("length"), "0")
+										.attr(xml::name::Name::local("type"), "audio/mp3"),
+									|_| Ok(())
+								)?;
+								
+								let published = video.published_at.to_rfc2822();
+								
+								writer.nest(
+									xml::writer::XmlEvent::start_element("pubDate"),
+									|writer| writer.write(
+										xml::writer::XmlEvent::characters(published.as_str())
+									)
+								)?;
+								
+								writer.nest(
+									xml::writer::XmlEvent::start_element("itunes:image")
+										.attr(xml::name::Name::local("href"), &video.image_url),
+									|_| Ok(())
+								)?;
+								
+								Ok(())
+							}
+						)?;
+					}
+					
+					Ok(())
+				}
+			)
+		).unwrap();
+		
+		let idk = writer.into_inner();
+		let kdi = std::str::from_utf8(idk.as_slice()).unwrap();
+		
+		String::from(kdi)
+	}
+	
+	fn update_channel_data_sync<T: AsRef<str>>(
+		handle: tokio::runtime::Handle,
+		connection: &mut rusqlite::Connection,
+		youtube_hub: &google_youtube3::YouTube<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
+		youtube_update_delay: chrono::Duration,
+		channel_id: T,
+	) {
+		let channel_id = channel_id.as_ref();
+		
+		let last_updated_timestamp: Option<chrono::DateTime<chrono::Utc>> = {
+			connection.query_row(
+				"SELECT last_updated_timestamp FROM Channel WHERE id = ?",
+				rusqlite::params![channel_id],
+				|row| row.get(0),
+			).optional().unwrap()
+		};
+		
+		let update_video_data = {
+			if let Some(last_updated_timestamp) = last_updated_timestamp {
+				chrono::Utc::now() - last_updated_timestamp > youtube_update_delay
+			} else {
+				true
+			}
+		};
+		
+		if update_video_data {
+			// Download and save video information, until we hit
+			// a primary key violation (which means that we're
+			// all updated).
+			
 			let transaction = connection.transaction().unwrap();
 			
+			// Get channel data.
+			let search = {
+				 youtube_hub.search()
+					.list(&vec!["id".to_string(), "snippet".to_string()])
+					.add_type("channel")
+					.channel_id(channel_id)
+			};
+			
+			let (_, results) = tokio_scoped::scoped(&handle).scope(|scope| {
+				scope.block_on(async {
+					search.doit().await
+				})
+			}).unwrap();
+			
+			let items = results.items.unwrap();
+			assert!(items.len() == 1);
+			
+			let channel = &items[0];
+			let snippet = channel.snippet.as_ref().unwrap();
+			
+			transaction.execute(
+				"INSERT OR REPLACE INTO Channel (id, name, description, image_url, last_updated_timestamp) VALUES (?, ?, ?, ?, ?)",
+				rusqlite::params![
+					channel_id,
+					snippet.channel_title,
+					snippet.description,
+					snippet
+						.thumbnails.as_ref().unwrap()
+						.default.as_ref().unwrap()
+						.url.as_ref().unwrap(),
+					chrono::Utc::now(),
+				],
+			).unwrap();
+			
+			// Get videos data.
+			let mut page_token: Option<String> = None;
 			'downloading: loop {
 				let (_, results) = {
 					let search = {
@@ -442,7 +391,11 @@ impl App {
 						search
 					};
 					
-					search.doit().await.unwrap()
+					tokio_scoped::scoped(&handle).scope(|scope| {
+						scope.block_on(async {
+							search.doit().await
+						})
+					}).unwrap()
 				};
 				
 				page_token = results.next_page_token;
@@ -463,8 +416,6 @@ impl App {
 								.default.as_ref().unwrap()
 								.url.as_ref().unwrap(),
 							snippet.published_at.as_ref().unwrap(),
-							chrono::Utc::now(),
-							audio::State::NotDownloaded,
 						],
 					);
 					
@@ -481,90 +432,17 @@ impl App {
 			}
 			
 			transaction.commit().unwrap();
-		} else {
-			// Download all video information from scratch.
-			
-			let (_, results) = youtube_hub.search()
-				.list(&vec!["id".to_string(), "snippet".to_string()])
-				.add_type("channel")
-				.channel_id(channel_id)
-				.doit().await.unwrap();
-			
-			let items = results.items.unwrap();
-			assert!(items.len() == 1);
-			
-			let transaction = connection.transaction().unwrap();
-			
-			{
-				let channel = &items[0];
-				let snippet = channel.snippet.as_ref().unwrap();
-				
-				transaction.execute(
-					"INSERT INTO Channel (id, name, description, image_url) VALUES (?, ?, ?, ?)",
-					rusqlite::params![
-						channel_id,
-						snippet.channel_title,
-						snippet.description,
-						snippet
-							.thumbnails.as_ref().unwrap()
-							.default.as_ref().unwrap()
-							.url.as_ref().unwrap(),
-					],
-				).unwrap();
-			}
-			
-			let mut page_token: Option<String> = None;
-			
-			loop {
-				let (_, results) = {
-					let search = {
-						youtube_hub.search()
-							.list(&vec!["id".to_string(), "snippet".to_string()])
-							.add_type("video")
-							.channel_id(channel_id)
-							.order("date")
-							.max_results(50)
-					};
-					
-					let search = if let Some(page_token) = page_token {
-						search.page_token(page_token.as_str())
-					} else {
-						search
-					};
-					
-					search.doit().await.unwrap()
-				};
-				
-				page_token = results.next_page_token;
-				
-				let items = results.items.unwrap();
-				for item in items.iter() {
-					let snippet = item.snippet.as_ref().unwrap();
-					transaction.execute(
-						"INSERT INTO Video (id, channel_id, name, description, image_url, published_timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-						rusqlite::params![
-							item.id.as_ref().unwrap().video_id.as_ref().unwrap(),
-							snippet.channel_id.as_ref().unwrap(),
-							snippet.title.as_ref().unwrap(),
-							snippet.description.as_ref().unwrap(),
-							snippet
-								.thumbnails.as_ref().unwrap()
-								.default.as_ref().unwrap()
-								.url.as_ref().unwrap(),
-							snippet.published_at.as_ref().unwrap(),
-							chrono::Utc::now(),
-							audio::State::NotDownloaded,
-						],
-					).unwrap();
-				}
-				
-				if page_token.is_none() {
-					break;
-				}
-			}
-			
-			transaction.commit().unwrap();
 		}
+	}
+	
+	async fn update_channel_data<T: AsRef<str>>(&self, channel_id: T) {
+		App::update_channel_data_sync(
+			tokio::runtime::Handle::current(),
+			&mut *self.connection.lock().await,
+			&self.youtube_hub,
+			self.config.youtube_update_delay,
+			channel_id,
+		);
 	}
 	
 	async fn get_video_audio<T: AsRef<str>>(&self, video_id: T) -> std::fs::File {
@@ -572,115 +450,92 @@ impl App {
 		
 		let audio_filename = format!("{video_id}.mp3");
 		
-		let audio_thing = self.audio_thing.lock().await;
-		let connection = self.connection.lock().await;
-		
-		let row = {
-			connection.query_row(
-				"SELECT state FROM Audio WHERE video_id = ?",
+		let audio_downloaded = {
+			self.connection.lock().await.query_row(
+				"SELECT EXISTS (SELECT 1 FROM Audio WHERE video_id = ?)",
 				rusqlite::params![video_id],
-				|row| row.get::<_, audio::State>(0),
-			).optional().unwrap()
+				|row| row.get::<_, bool>(0),
+			).unwrap()
 		};
 		
-		async fn download<'a, T: AsRef<str>>(
-			app: &App,
-			video_id: T,
-			audio_filename: T,
-			connection: tokio::sync::MutexGuard<'a, rusqlite::Connection>,
-			mut audio_thing: tokio::sync::MutexGuard<'a, HashMap<String, std::sync::Arc<tokio::sync::Notify>>>,
-		) {
-			// Download audio and register it into the db.
-			
-			let video_id = video_id.as_ref();
-			
-			connection.execute(
-				"INSERT INTO Audio (video_id, accessed_timestamp) VALUES (?, ?)",
-				rusqlite::params![video_id, chrono::Utc::now()],
-			).unwrap();
-			std::mem::drop(connection);
-			
-			let notify_downloaded = std::sync::Arc::new(tokio::sync::Notify::new());
-			audio_thing.insert(String::from(video_id), notify_downloaded.clone());
-			std::mem::drop(audio_thing);
-			
-			// MAYBE: Log stdout and stderr.
-			async_process::Command::new("yt-dlp")
-				.stdout(async_process::Stdio::null())
-				.stderr(async_process::Stdio::null())
-				.arg(format!("https://www.youtube.com/watch?v={video_id}"))
-				.arg("--extract-audio")
-				.arg("--audio-format")
-				.arg("mp3")
-				.arg("-o")
-				.arg(audio_filename.as_ref())
-				.spawn()
-				.unwrap()
-				.output().await.unwrap();
-			
-			{
-				let connection = app.connection.lock().await;
-				connection.execute(
-					"UPDATE Audio SET state = ? WHERE video_id = ?",
-					rusqlite::params![audio::State::Downloaded, video_id],
+		let mut update_last_accessed_timestamp = true;
+		
+		if !audio_downloaded {
+			let audio_thing = self.audio_thing.lock().await;
+			let notify_downloaded = audio_thing.get(video_id);
+			if let Some(notify_downloaded) = notify_downloaded {
+				notify_downloaded.notified().await;
+			} else {
+				// Download audio and register it into the db.
+				
+				let notify_downloaded = {
+					let mut audio_thing = audio_thing;
+					let notify_downloaded = std::sync::Arc::new(tokio::sync::Notify::new());
+					audio_thing.insert(String::from(video_id), notify_downloaded.clone());
+					notify_downloaded
+				};
+				
+				// TODO: Delete the tmp_path if the command fails.
+				// TODO: Log stdout and stderr.
+				
+				// Run command to download audio.
+				let tmp_path = std::path::Path::new(".")
+					.join(AUDIO_TMP_PATH.as_os_str())
+					.join(&video_id);
+				
+				async_process::Command::new("yt-dlp")
+					.stdout(async_process::Stdio::null())
+					.stderr(async_process::Stdio::null())
+					.arg(format!("https://www.youtube.com/watch?v={video_id}"))
+					.arg("--extract-audio")
+					.arg("--audio-format")
+						.arg("mp3")
+					.arg("--paths")
+						.arg(&tmp_path)
+					.arg("-o")
+						.arg(&audio_filename)
+					.spawn()
+					.unwrap()
+					.output().await.unwrap();
+				
+				// Move audio filename from temporary folder
+				// to cache.
+				let audio_old_path = tmp_path.join(&audio_filename);
+				
+				let audio_new_path = std::path::Path::new(".")
+					.join(AUDIO_CACHE_PATH.as_os_str())
+					.join(&audio_filename);
+				
+				std::fs::rename(audio_old_path, audio_new_path).unwrap();
+				
+				// Clean up temporary directory.
+				std::fs::remove_dir_all(tmp_path).unwrap();
+				
+				// calculate size of all downloaded videos
+				// if the size is above the max
+				// get audio sorted ascending by last access
+				// while the size is above the max
+				// delete audio (remove from table, etc.)
+				// if the audio to-be-deleted happens to be the just downloaded audio, then stop
+				
+				update_last_accessed_timestamp = false;
+				self.connection.lock().await.execute(
+					"INSERT INTO Audio (video_id, last_accessed_timestamp) VALUES (?, ?)",
+					rusqlite::params![video_id, chrono::Utc::now()],
 				).unwrap();
+				
+				self.audio_thing.lock().await.remove(video_id).unwrap();
+				
+				notify_downloaded.notify_waiters();
 			}
-			
-			notify_downloaded.notify_waiters();
 		}
 		
-		// try select audio from table
-		// - if it exists:
-		//   - if there's no notify, that means it's downloaded
-		//   - if there's a notify, wait on the notify
-		// - if it doesn't exist, you have to download it: start downloading, add notify
-		
-		if let Some(state) = row {
-			match state {
-				audio::State::NotDownloaded => {
-					todo!()
-				}
-				audio::State::Downloaded => {
-					// Do nothing.
-				}
-				audio::State::Downloading => {
-					let notify_downloaded = {
-						audio_thing.get(video_id)
-							.map(|notify_downloaded| notify_downloaded.clone())
-					};
-					
-					if let Some(notify_downloaded) = notify_downloaded {
-						// Wait until the audio has been downloaded.
-						
-						std::mem::drop(audio_thing);
-						notify_downloaded.notified().await;
-					} else {
-						// This means that it attempted to download the file before, but failed.
-						
-						connection.execute(
-							"DELETE FROM Audio WHERE video_id = ?",
-							rusqlite::params![video_id]
-						).unwrap();
-						
-						download(
-							self,
-							video_id,
-							&audio_filename,
-							connection,
-							audio_thing,
-						).await;
-					}
-				}
-			}
-		} else {
-			download(
-				self,
-				video_id,
-				&audio_filename,
-				connection,
-				audio_thing,
-			).await;
-		};
+		if update_last_accessed_timestamp {
+			self.connection.lock().await.execute(
+				"UPDATE Audio SET last_accessed_timestamp = ? WHERE video_id = ?",
+				rusqlite::params![chrono::Utc::now(), video_id],
+			).unwrap();
+		}
 		
 		std::fs::File::open(audio_filename).unwrap()
 	}
@@ -709,7 +564,7 @@ async fn dingus(
 				}
 				"/feed/channel_id" => {
 					let channel_id = path.file_name().unwrap().to_str().unwrap();
-					let feed = get_feed_from_channel_id(&channel_id).await;
+					let feed = app.get_feed_from_channel_id(&channel_id).await;
 					anyhow::Ok(
 						hyper::Response::builder()
 							.header(hyper::header::CONTENT_TYPE, "application/rss+xml; charset=utf-8")
@@ -753,11 +608,19 @@ async fn main() {
 	// NOTE: It should theoretically be possible to have an immutable
 	// reference instead of an Arc, but I couldn't figure it out.
 	
-	let app = std::sync::Arc::new(App::new(youtube_secret).await);
+	std::env::set_current_dir(args.working_dir).unwrap();
+	
+	let app_config = AppConfig {
+		audio_cache_size: 1024 * 1024 * 16,
+		domain: String::from("172.30.111.80"),
+		youtube_update_delay: chrono::Duration::minutes(15),
+	};
+	
+	let app = std::sync::Arc::new(App::new(app_config, youtube_secret).await);
 	
 	{
 		// app.test("UC3cpN6gcJQqcCM6mxRUo_dA").await;
-		app.update_channel_data("UC3cpN6gcJQqcCM6mxRUo_dA").await;
+		// app.update_channel_data("UC3cpN6gcJQqcCM6mxRUo_dA").await;
 	}
 	
 	let make_service = {

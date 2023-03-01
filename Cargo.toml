@@ -11,12 +11,14 @@ edition = "2021"
 async-process = "1.6.0"
 hyper-rustls = "0.23.2"
 hyper = { version = "0.14.24", features = ["full"] }
+tokio-scoped = "0.2.0"
 tokio = { version = "1.25.0", features = ["full"] }
 
 # util
 anyhow = "1.0.69"
 chrono = "0.4.23"
 clap = { version = "4.1.6", features = ["derive"] }
+lazy_static = "1.4.0"
 xml-rs = "0.8.4"
 
 # apis
