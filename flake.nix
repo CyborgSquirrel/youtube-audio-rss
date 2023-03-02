@@ -33,6 +33,7 @@
             pkgs.openssl
             pkgs.openssl.dev
             pkgs.yt-dlp
+            pkgs.aria2
           ];
           nativeBuildInputs = [
             pkgs.pkg-config
