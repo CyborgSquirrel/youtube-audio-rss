@@ -19,7 +19,7 @@
                  inherit system;
                };
              in {
-                yt-dlp = unstable.yt-dlp;
+                inherit (unstable) yt-dlp rustc cargo;
               }
             )
           ];

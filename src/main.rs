@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use clap::Parser;
 
 #[derive(Debug, clap::Parser)]
@@ -16,7 +18,7 @@ pub struct AppConfig {
 }
 
 mod web {
-    use std::io::Read;
+    use std::{io::Read, sync::Arc};
 
 	trait EventWriterExt {
 		fn nest<'a, F>(
@@ -49,23 +51,21 @@ mod web {
 		xml::name::Name::prefixed(local_name, prefix)
 	}
 
-	async fn get_feed_from_channel_id<T: AsRef<str>>(
-		app_config: crate::AppConfig,
+	async fn get_feed(
+		app_config: Arc<crate::AppConfig>,
 		youtube_data_request_sender: tokio::sync::mpsc::UnboundedSender<(tokio::sync::oneshot::Sender<crate::youtube_data::Channel>, crate::youtube_data::ChannelIdentifier)>,
-		channel_id: T,
+		channel_identifier: &crate::youtube_data::ChannelIdentifier,
 	) -> String {
 		// TODO: Maybe add some of the following tags:
 		// itunes:author
 		// itunes:duration
 		// itunes:explicit
 		
-		let channel_id = channel_id.as_ref();
-		
 		let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
 		youtube_data_request_sender.send((
 			response_sender,
-			crate::youtube_data::ChannelIdentifier::Id(String::from(channel_id)),
-		));
+			channel_identifier.clone(),
+		)).unwrap();
 		let channel = response_receiver.await.unwrap();
 		
 		let writer_inner = Vec::new();
@@ -88,7 +88,7 @@ mod web {
 					writer.nest(
 						xml::writer::XmlEvent::start_element("title"),
 						|writer| writer.write(
-							xml::writer::XmlEvent::characters(&channel.name)
+							xml::writer::XmlEvent::characters(&channel.username)
 						)
 					)?;
 					writer.nest(
@@ -144,11 +144,11 @@ mod web {
 									)
 								)?;
 								
-								// TODO: escape cdata
 								writer.nest(
 									xml::writer::XmlEvent::start_element("content:encoded"),
 									|writer| writer.write(
-										xml::writer::XmlEvent::cdata(&video.description)
+										xml::writer::XmlEvent::cdata(
+											&xml::escape::escape_str_pcdata(&video.description))
 									)
 								)?;
 								
@@ -195,15 +195,15 @@ mod web {
 			)
 		).unwrap();
 		
-		let idk = writer.into_inner();
-		let kdi = std::str::from_utf8(idk.as_slice()).unwrap();
+		let bytes = writer.into_inner();
+		let string = std::str::from_utf8(bytes.as_slice()).unwrap();
 		
-		String::from(kdi)
+		String::from(string)
 	}	
 
 	pub async fn server(
-		config: crate::AppConfig,
-		audio_request_sender: tokio::sync::mpsc::UnboundedSender<(tokio::sync::oneshot::Sender<std::fs::File>, String)>,
+		config: Arc<crate::AppConfig>,
+		audio_cache_request_sender: tokio::sync::mpsc::UnboundedSender<(tokio::sync::oneshot::Sender<crate::audio_cache::CachedAudioFile>, String)>,
 		youtube_data_request_sender: tokio::sync::mpsc::UnboundedSender<(tokio::sync::oneshot::Sender<crate::youtube_data::Channel>, crate::youtube_data::ChannelIdentifier)>,
 		request: hyper::Request<hyper::Body>,
 	) -> anyhow::Result<hyper::Response<hyper::Body>> {
@@ -216,15 +216,15 @@ mod web {
 						let video_id = path.file_stem().unwrap().to_str().unwrap();
 
 						let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
-						audio_request_sender.send((
+						audio_cache_request_sender.send((
 							response_sender,
 							String::from(video_id),
 						)).unwrap();
 		
-						let mut audio_file = response_receiver.await.unwrap();
+						let mut cached_audio_file = response_receiver.await.unwrap();
 
 						let mut audio = Vec::new();
-						audio_file.read_to_end(&mut audio).unwrap();
+						cached_audio_file.file_mut().read_to_end(&mut audio).unwrap();
 						anyhow::Ok(
 							hyper::Response::builder()
 								.header(hyper::header::CONTENT_TYPE, "audio/mp3")
@@ -233,11 +233,14 @@ mod web {
 						)
 					}
 					"/feed/channel_id" => {
-						let channel_id = path.file_name().unwrap().to_str().unwrap();
-						let feed = get_feed_from_channel_id(
+						let channel_id = path
+							.file_name().unwrap()
+							.to_str().unwrap()
+							.to_string();
+						let feed = get_feed(
 							config.clone(),
 							youtube_data_request_sender,
-							&channel_id,
+							&crate::youtube_data::ChannelIdentifier::Id(channel_id),
 						).await;
 						anyhow::Ok(
 							hyper::Response::builder()
@@ -246,8 +249,22 @@ mod web {
 								.unwrap()
 						)
 					}
-					"/feed/channel_username" => {
-						todo!()
+					"/feed/channel_custom_url" => {
+						let channel_custom_url = path
+							.file_name().unwrap()
+							.to_str().unwrap()
+							.to_string();
+						let feed = get_feed(
+							config.clone(),
+							youtube_data_request_sender,
+							&crate::youtube_data::ChannelIdentifier::CustomUrl(channel_custom_url),
+						).await;
+						anyhow::Ok(
+							hyper::Response::builder()
+								.header(hyper::header::CONTENT_TYPE, "application/rss+xml; charset=utf-8")
+								.body(hyper::Body::from(feed))
+								.unwrap()
+						)
 					}
 					_ => {
 						Ok(
@@ -275,11 +292,14 @@ mod web {
 }
 
 mod youtube_data {
+    use std::sync::Arc;
+
     use rusqlite::OptionalExtension;
+    use tokio::sync::Mutex;
 
 	#[derive(Debug)]
 	pub struct Channel {
-		pub name: String,
+		pub username: String,
 		pub description: String,
 		pub image_url: String,
 		pub videos: Vec<Video>,
@@ -294,29 +314,31 @@ mod youtube_data {
 		pub published_at: chrono::DateTime<chrono::Utc>,
 	}
 	
-	#[derive(Debug)]
+	#[derive(Debug, Clone)]
 	pub enum ChannelIdentifier {
 		Id(String),
-		Name(String),
+		CustomUrl(String),
 	}
 	
 	pub async fn server(
-		app_config: crate::AppConfig,
+		app_config: Arc<crate::AppConfig>,
 		youtube_secret: google_youtube3::oauth2::ServiceAccountKey,
 		mut request_receiver: tokio::sync::mpsc::UnboundedReceiver<(tokio::sync::oneshot::Sender<Channel>, ChannelIdentifier)>
 	) {
-		let connection = std::sync::Arc::new(tokio::sync::Mutex::new(
-			rusqlite::Connection::open("youtube.db").unwrap()));
-		
-		connection.lock().await.execute_batch("
+		// Set up database.
+		let connection = rusqlite::Connection::open("youtube.db").unwrap();
+		connection.execute_batch("
 			CREATE TABLE IF NOT EXISTS Channel
 				( id TEXT PRIMARY KEY
 				
-				, name TEXT
+				, username TEXT
 				, description TEXT
 				, image_url TEXT
+				, custom_url
 				
 				, last_updated_timestamp INTEGER
+
+				, UNIQUE(username)
 			);
 			
 			CREATE TABLE IF NOT EXISTS Video
@@ -331,31 +353,59 @@ mod youtube_data {
 				, FOREIGN KEY(channel_id) REFERENCES Channel(id)
 			);
 		").unwrap();
+
+		let connection = Arc::new(Mutex::new(connection));
 		
-		let auth = google_youtube3::oauth2::ServiceAccountAuthenticator::builder(
-			youtube_secret
-		).build().await.unwrap();
-		let youtube_hub =
-			google_youtube3::YouTube::new(hyper::Client::builder().build(hyper_rustls::HttpsConnectorBuilder::new().with_native_roots().https_or_http().enable_http1().enable_http2().build()), auth);
+		// Initialize youtube api.
+		let auth = {
+			google_youtube3::oauth2::ServiceAccountAuthenticator::builder(
+				youtube_secret
+			).build().await.unwrap()
+		};
+		let youtube_hub = {
+			google_youtube3::YouTube::new(
+				hyper::Client::builder()
+					.build(
+						hyper_rustls::HttpsConnectorBuilder::new()
+							.with_native_roots()
+							.https_or_http()
+							.enable_http1()
+							.enable_http2()
+							.build()), auth)
+		};
 		
 		while let Some((sender, channel_identifier)) = request_receiver.recv().await {
 			let connection = connection.clone();
 			let youtube_hub = youtube_hub.clone();
+			let app_config = app_config.clone();
 			tokio::spawn(async move {
-				let channel_id = match channel_identifier {
-					ChannelIdentifier::Id(channel_id) => channel_id,
-					ChannelIdentifier::Name(_) => todo!(),
-				};
-				
 				let mut connection = connection.lock().await;
 				
-				update_channel_data_sync(
-					tokio::runtime::Handle::current(),
-					&mut connection,
-					&youtube_hub,
-					app_config.youtube_update_delay,
-					&channel_id,
-				);
+				let channel_id = {
+					update_channel_data(
+						app_config.clone(),
+						&mut connection,
+						&youtube_hub,
+						&channel_identifier,
+					).await.unwrap()
+				};
+				
+				struct ChannelMetadata {
+					username: String,
+					description: String,
+					image_url: String,
+				}
+
+				let channel_metadata = {
+					connection.query_row(
+						"SELECT username, description, image_url FROM Channel WHERE id = ?",
+						rusqlite::params![channel_id],
+						|row| Ok(
+							ChannelMetadata {
+								username: row.get(0)?,
+								description: row.get(1)?,
+								image_url: row.get(2)?})).unwrap()
+				};
 
 				let videos: Vec<_> = {
 					let mut statement = connection.prepare(
@@ -375,23 +425,101 @@ mod youtube_data {
 			
 					rows.map(|row| row.unwrap()).collect()
 				};
-
-				let channel = {
-					connection.query_row(
-						"SELECT name, description, image_url FROM Channel WHERE id = ?",
-						rusqlite::params![channel_id],
-						|row| Ok(
-							Channel {
-								name: row.get(0)?,
-								description: row.get(1)?,
-								image_url: row.get(2)?,
-								videos}),
-					).unwrap()
+				
+				let channel = Channel {
+					username: channel_metadata.username,
+					description: channel_metadata.description,
+					image_url: channel_metadata.image_url,
+					videos,
 				};
-		
+
 				sender.send(channel).unwrap();
 			});
 		}
+	}
+	
+	#[derive(Debug)]
+	pub enum Error {
+		InvalidChannelId,
+		InvalidChannelCustomUrl,
+	}
+	
+	async fn update_channel_data(
+		app_config: Arc<crate::AppConfig>,
+		connection: &mut rusqlite::Connection,
+		youtube_hub: &google_youtube3::YouTube<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
+		channel_identifier: &ChannelIdentifier,
+	) -> Result<String, Error> {
+		let channel_id = {
+			match channel_identifier {
+				ChannelIdentifier::Id(id) => id.clone(),
+				ChannelIdentifier::CustomUrl(custom_url) => {
+					let channel_id: Option<String> = {
+						connection.query_row(
+							"SELECT id FROM Channel WHERE custom_url = ?",
+							rusqlite::params![custom_url],
+							|row| row.get(0),
+						).optional().unwrap()
+					};
+					
+					if let Some(channel_id) = channel_id {
+						channel_id
+					} else {
+						// Scrape the channel_id from the page, cause' there's no way to get a
+						// channel_id from a channel's custom_url using the youtube api :(.
+						
+						let https = hyper_rustls::HttpsConnectorBuilder::new()
+							.with_native_roots()
+							.https_only()
+							.enable_http1()
+							.build();
+					
+						let client: hyper::Client<_, hyper::Body> = hyper::Client::builder().build(https);
+					
+						let uri = hyper::Uri::builder()
+							.scheme("https")
+							.authority("www.youtube.com")
+							.path_and_query(format!("/{}", &custom_url))
+							.build()
+							.unwrap();
+						
+						let response = client.get(uri).await.unwrap();
+						let (_head, body) = response.into_parts();
+						let bytes = hyper::body::to_bytes(body).await.unwrap();
+						let text = std::str::from_utf8(&bytes).unwrap();
+						
+						// TODO: check for this not working
+						
+						let regex_source = r#"<link rel="alternate" type="application/rss[+]xml" title="RSS" href="https://www[.]youtube[.]com/feeds/videos[.]xml[?]channel_id=([^"]*)">"#;
+						let regex = regex::RegexBuilder::new(regex_source).build().unwrap();
+						let channel_id = regex.captures(text).unwrap()
+							.get(1).unwrap()
+							.as_str().to_string();
+					
+						channel_id
+					}
+				}
+			}
+		};
+		
+		update_channel_data_sync(
+			tokio::runtime::Handle::current(),
+			connection,
+			&youtube_hub,
+			app_config.youtube_update_delay,
+			&channel_id,
+		)
+			.map(|_| channel_id)
+			.map_err(|err| match err {
+				Error::InvalidChannelId => {
+					if let ChannelIdentifier::CustomUrl(_) = channel_identifier {
+						Error::InvalidChannelCustomUrl
+					} else {
+						err
+					}
+				}
+				_ => err,
+			})
 	}
 	
 	fn update_channel_data_sync<T: AsRef<str>>(
@@ -400,7 +528,7 @@ mod youtube_data {
 		youtube_hub: &google_youtube3::YouTube<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
 		youtube_update_delay: chrono::Duration,
 		channel_id: T,
-	) {
+	) -> Result<(), Error> {
 		let channel_id = channel_id.as_ref();
 		
 		let last_updated_timestamp: Option<chrono::DateTime<chrono::Utc>> = {
@@ -420,9 +548,8 @@ mod youtube_data {
 		};
 		
 		if update_video_data {
-			// Download and save video information, until we hit
-			// a primary key violation (which means that we're
-			// all updated).
+			// Download and save video information, until we hit a primary key violation
+			// (which means that we're all updated).
 			
 			let transaction = connection.transaction().unwrap();
 			
@@ -439,7 +566,10 @@ mod youtube_data {
 				})
 			}).unwrap();
 			
-			let items = results.items.unwrap();
+			let Some(items) = results.items else {
+				return Err(Error::InvalidChannelId);
+			};
+
 			assert!(items.len() == 1);
 			
 			let channel = &items[0];
@@ -453,9 +583,9 @@ mod youtube_data {
 			};
 			
 			transaction.execute(
-				"INSERT OR REPLACE INTO Channel (id, name, description, image_url, last_updated_timestamp) VALUES (?, ?, ?, ?, ?)",
+				"INSERT OR REPLACE INTO Channel (id, username, description, image_url, last_updated_timestamp) VALUES (?, ?, ?, ?, ?)",
 				rusqlite::params![
-					channel_id,
+					channel.id.as_ref().unwrap(),
 					snippet.title,
 					snippet.description,
 					snippet
@@ -526,203 +656,148 @@ mod youtube_data {
 			
 			transaction.commit().unwrap();
 		}
+		
+		Ok(())
 	}
 }
 
 mod audio_download {
-    use std::collections::HashMap;
+    use std::{path::PathBuf, sync::Arc, collections::HashSet};
+
+    use tokio::sync::{mpsc, oneshot, Mutex};
 
 	lazy_static::lazy_static! {
-		pub static ref AUDIO_CACHE_PATH: &'static std::path::Path = std::path::Path::new("audio_cache");
-		pub static ref AUDIO_TMP_PATH: &'static std::path::Path = std::path::Path::new("audio_tmp");
-		pub static ref AUDIO_OUTPUT_PATH: &'static std::path::Path = std::path::Path::new("audio_output");
+		static ref AUDIO_TMP_PATH: &'static std::path::Path = std::path::Path::new("audio_tmp");
+		static ref AUDIO_OUTPUT_PATH: &'static std::path::Path = std::path::Path::new("audio_output");
+	}
+	
+	#[derive(Debug)]
+	pub enum Error {
+		AlreadyDownloading,
+		YtDlpError(String),
 	}
 	
 	pub async fn server(
-		app_config: crate::AppConfig,
-		mut audio_request_receiver: tokio::sync::mpsc::UnboundedReceiver<(tokio::sync::oneshot::Sender<std::fs::File>, String)>
+		app_config: Arc<crate::AppConfig>,
+		mut request_receiver: mpsc::UnboundedReceiver<(oneshot::Sender<Result<PathBuf, Error>>, String)>,
 	) {
-	
-		while let Some((sender, video_id)) = audio_request_receiver.recv().await {
-			let audio_thing = audio_thing.clone();
-			let connection = connection.clone();
-			tokio::spawn(async move {
-				let audio_filename = format!("{video_id}.mp3");
-				let audio_path = std::path::Path::new(".")
-					.join(AUDIO_CACHE_PATH.as_os_str())
-					.join(&audio_filename);
+		std::fs::remove_dir_all(std::path::Path::new(".").join(AUDIO_TMP_PATH.as_os_str())).unwrap();
+		std::fs::create_dir_all(std::path::Path::new(".").join(AUDIO_TMP_PATH.as_os_str())).unwrap();
+
+		std::fs::remove_dir_all(std::path::Path::new(".").join(AUDIO_OUTPUT_PATH.as_os_str())).unwrap();
+		std::fs::create_dir_all(std::path::Path::new(".").join(AUDIO_OUTPUT_PATH.as_os_str())).unwrap();
+
+		let currently_downloading: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+		while let Some((sender, video_id)) = request_receiver.recv().await {
+			let mut currently_downloading_lock = currently_downloading.lock().await;
+			if currently_downloading_lock.contains(&video_id) {
+				sender.send(Err(Error::AlreadyDownloading)).unwrap();
+			} else {
+				currently_downloading_lock.insert(video_id.clone());
+				std::mem::drop(currently_downloading_lock);
+
+				let currently_downloading = currently_downloading.clone();
+				tokio::spawn(async move {
+					let audio_filename = format!("{video_id}.mp3");
+
+					let audio_output_path = std::path::Path::new(".")
+						.join(AUDIO_OUTPUT_PATH.as_os_str())
+						.join(&audio_filename);
 			
-				if !audio_downloaded {
-					let audio_thing_lock = audio_thing.lock().await;
-				
-					let notify_downloaded = audio_thing_lock.get(&video_id).map(|notify_downloaded| notify_downloaded.clone());
-				
-					let notify_downloaded = {
-						if let Some(notify_downloaded) = notify_downloaded {
-							std::mem::drop(audio_thing_lock);
-							notify_downloaded
-						} else {
-							let mut audio_thing_lock = audio_thing_lock;
-							let notify_downloaded = {
-								let notify_downloaded = std::sync::Arc::new(tokio::sync::Notify::new());
-								audio_thing_lock.insert(video_id.clone(), notify_downloaded.clone());
-								notify_downloaded
-							};
-							std::mem::drop(audio_thing_lock);
-							let notify_downloaded_clone = notify_downloaded.clone();
-						
-							let audio_path = audio_path.clone();
-							let audio_thing = audio_thing.clone();
-							tokio::spawn(async move {
-								// Download audio and register it into the db.
-							
-								// TODO: Delete the tmp_path if the command fails.
-								// TODO: Log stdout and stderr.
-							
-								// Run command to download audio.
-								let tmp_path = std::path::Path::new(".")
-									.join(AUDIO_TMP_PATH.as_os_str())
-									.join(&video_id);
-							
-								dbg!("starting command");
-								let output = {
-									tokio::process::Command::new("yt-dlp")
-										.stdin(std::process::Stdio::null())
-										.arg(format!("https://www.youtube.com/watch?v={video_id}"))
-										.arg("--external-downloader")
-											.arg("aria2c")
-										.arg("--external-downloader-args")
-											.arg("-j 4 -x 8 -s 8 -k 1M")
-										.arg("--extract-audio")
-										.arg("--audio-format")
-											.arg("mp3")
-										.arg("--paths")
-											.arg(&tmp_path)
-										.arg("-o")
-											.arg(&audio_filename)
-										.output().await.unwrap()
-								};
-							
-								dbg!(String::from_utf8(output.stderr).unwrap());
-								dbg!(String::from_utf8(output.stdout).unwrap());
-							
-								dbg!("what");
-							
-								// NOTE: There could theoretically be
-								// an issue, if the audio gets added
-								// to the db, and the program stops
-								// afterward for some reason, without
-								// actually moving the file.
-							
-								// Not gonna deal with that for now though.
-							
-								// Add audio to database.
-								let audio_tmp_path = tmp_path.join(&audio_filename);
-								let metadata = std::fs::metadata(&audio_tmp_path).unwrap();
-							
-								connection.lock().await.execute(
-									"INSERT INTO Audio (video_id, size, last_accessed_timestamp) VALUES (?, ?, ?)",
-									rusqlite::params![video_id, metadata.len(), chrono::Utc::now()],
-								).unwrap();
-							
-								// Move audio from temporary folder
-								// to cache.
-								std::fs::rename(&audio_tmp_path, &audio_path).unwrap();
-							
-								// Clean up temporary directory.
-								std::fs::remove_dir_all(tmp_path).unwrap();
-							
-								// Make sure audio cache size doesn't exceed limit.
-								#[derive(Debug)]
-								struct Audio {
-									video_id: String,
-									size: u64,
-								}
-							
-								let mut audios: Vec<_> = {
-									let connection = connection.lock().await;
-									let mut statement = connection.prepare(
-										"SELECT video_id, size FROM Audio ORDER BY last_accessed_timestamp"
-									).unwrap();
-	
-									let rows = statement.query_map(
-										rusqlite::params![],
-										|row| Ok(
-											Audio {
-												video_id: row.get(0)?,
-												size: row.get(1)?}),
-									).unwrap();
-	
-									let rows = rows.map(|row| row.unwrap()).collect();
-									std::mem::drop(statement);
-									std::mem::drop(connection);
-									rows
-								};
-								let mut audio_cache_size: u64 = 0;
-							
-								dbg!(&audios);
-							
-								let audio_cache_path = std::path::Path::new(".")
-									.join(AUDIO_CACHE_PATH.as_os_str());
-								if audio_cache_size > app_config.audio_cache_size {
-									while !audios.is_empty()
-										&& audio_cache_size > app_config.audio_cache_size
-									{
-										let audio = audios.pop().unwrap();
-										// Make sure we don't
-										// delete the audio we
-										// just downloaded.
-										if audio.video_id != video_id {
-											let audio_path = audio_cache_path.join(format!("{}.mp3", audio.video_id));
-											audio_cache_size -= audio.size;
-											std::fs::remove_file(&audio_path).unwrap();
-										}
-									}
-								}
-							
-								audio_thing.lock().await.remove(&video_id).unwrap();
-								notify_downloaded.notify_waiters();
-							});
-						
-							notify_downloaded_clone
-						}
+					// TODO: Delete the tmp_path if the command fails.
+					// TODO: Log stdout and stderr.
+			
+					let tmp_path = std::path::Path::new(".")
+						.join(AUDIO_TMP_PATH.as_os_str())
+						.join(&video_id);
+			
+					let audio_tmp_path = tmp_path
+						.join(&audio_filename);
+					
+					// Run command to download audio.
+					dbg!("starting command");
+					let output = {
+						tokio::process::Command::new("yt-dlp")
+							.stdin(std::process::Stdio::null())
+							.arg(format!("https://www.youtube.com/watch?v={video_id}"))
+							.arg("--external-downloader")
+								.arg("aria2c")
+							.arg("--external-downloader-args")
+								.arg("-j 4 -x 8 -s 8 -k 1M")
+							.arg("--extract-audio")
+							.arg("--audio-format")
+								.arg("mp3")
+							.arg("--paths")
+								.arg(&tmp_path)
+							.arg("-o")
+								.arg(&audio_filename)
+							.output().await.unwrap()
 					};
-				
-					notify_downloaded.notified().await;
-				}
-				// TODO: Do something when the send is not successful.
-				sender.send(std::fs::File::open(audio_path).unwrap()).unwrap();
-			});
+			
+					let success = output.status.success();
+
+					if success {
+						// Move audio from temporary directory to output.
+						std::fs::rename(&audio_tmp_path, &audio_output_path).unwrap();
+					}
+			
+					// Clean up temporary directory.
+					std::fs::remove_dir_all(tmp_path).unwrap();
+			
+					if success {
+						sender.send(Ok(audio_output_path)).unwrap();
+					} else {
+						sender.send(Err(Error::YtDlpError(String::from_utf8(output.stderr).unwrap()))).unwrap();
+					}
+					currently_downloading.lock().await.remove(&video_id);
+				});
+			}
 		}
 	}
 }
 
-mod audio_db {
-	struct AudioSomething {
+mod audio_cache {
+    use std::{sync::Arc, collections::HashMap, path::PathBuf};
+
+    use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+
+	lazy_static::lazy_static! {
+		static ref AUDIO_CACHE_PATH: &'static std::path::Path = std::path::Path::new("./audio_cache");
+	}
+
+	#[derive(Debug)]
+	pub struct CachedAudioFile {
 		drop_sender: tokio::sync::mpsc::UnboundedSender<String>,
 		file: std::fs::File,
 		video_id: String,
 	}
 	
-	impl Drop for AudioSomething {
+	impl Drop for CachedAudioFile {
 		fn drop(&mut self) {
-			self.drop_sender.send(self.video_id);
+			self.drop_sender.send(self.video_id.clone()).unwrap();
 		}
 	}
 	
-	impl AudioSomething {
-		fn file_mut(&mut self) -> &mut std::fs::File { &mut self.file }
+	impl CachedAudioFile {
+		pub fn file_mut(&mut self) -> &mut std::fs::File { &mut self.file }
+	}
+	
+	fn video_id_to_audio_path<T: AsRef<str>>(video_id: T) -> std::path::PathBuf {
+		let video_id = video_id.as_ref();
+		let audio_filename = format!("{video_id}.mp3");
+		let audio_path = AUDIO_CACHE_PATH.join(audio_filename);
+		audio_path
 	}
 	
 	pub async fn server(
-		app_config: crate::AppConfig,
-		mut audio_request_receiver: tokio::sync::mpsc::UnboundedReceiver<(tokio::sync::oneshot::Sender<std::fs::File>, String)>,
-		mut youtube_download_request_sender: tokio::sync::mpsc::UnboundedSender<(tokio::sync::oneshot::Sender<std::fs::File>, String)>,
+		app_config: Arc<crate::AppConfig>,
+		mut request_receiver: tokio::sync::mpsc::UnboundedReceiver<(tokio::sync::oneshot::Sender<CachedAudioFile>, String)>,
+		audio_download_request_sender: mpsc::UnboundedSender<(oneshot::Sender<Result<PathBuf, crate::audio_download::Error>>, String)>,
 	) {
-		let audio_idk: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>>> = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-	
-		let connection: std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>> = std::sync::Arc::new(tokio::sync::Mutex::new(rusqlite::Connection::open("audio.db").unwrap()));
-		connection.lock().await.execute_batch("
+		// Set up database.
+		let mut connection = rusqlite::Connection::open("audio.db").unwrap();
+		connection.execute_batch("
 			CREATE TABLE IF NOT EXISTS Audio
 				( video_id TEXT PRIMARY KEY
 			
@@ -731,103 +806,263 @@ mod audio_db {
 				, last_accessed_timestamp INTEGER
 			);
 		").unwrap();
+		
+		// Set up directory.
+		std::fs::create_dir_all(AUDIO_CACHE_PATH.as_os_str()).unwrap();
+
+		// Delete any audio files that are in the database, but not in the directory.
+		{
+			let mut statement = connection.prepare(
+				"SELECT video_id FROM Audio"
+			).unwrap();
+
+			let video_ids: Vec<String> = statement.query_map(
+				rusqlite::params![],
+				|row| Ok(row.get(0)?),
+			).unwrap().map(|row| row.unwrap()).collect();
+			
+			std::mem::drop(statement);
+			
+			let transaction = connection.transaction().unwrap();
+			for video_id in video_ids {
+				let audio_path = video_id_to_audio_path(&video_id);
+				let metadata = std::fs::metadata(audio_path);
+				let file_exists = {
+					if let Err(err) = metadata {
+						if let std::io::ErrorKind::NotFound = err.kind() {
+							false
+						} else {
+							panic!();
+						}
+					} else {
+						true
+					}
+				};
+				if !file_exists {
+					transaction.execute(
+						"DELETE FROM Audio WHERE audio_id = ?",
+						rusqlite::params![video_id],
+					).unwrap();
+				}
+			}
+			transaction.commit().unwrap();
+		}
+
+		let connection: Arc<Mutex<rusqlite::Connection>> = Arc::new(Mutex::new(connection));
 
 		let (drop_sender, mut drop_receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
-		let mut audio_thingie: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+		let audio_reference_count: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+		let audio_download_notify: Arc<Mutex<HashMap<String, Arc<Notify>>>> = Arc::new(Mutex::new(HashMap::new()));
 		
 		loop {
 			tokio::select! {
-				// NOTE: Make sure to always serve all audio requests, before handling
-				// the drops, so that we don't delete an audio file which was actually
+				// NOTE: Make sure to always serve all audio requests, before handling the
+				// drops, so that we don't delete an audio file which was actually
 				// requested.
 			
 				biased;
 
-				request = audio_request_receiver.recv() => {
-					let audio_downloaded = {
-						connection.lock().await.query_row(
-							"SELECT EXISTS (SELECT 1 FROM Audio WHERE video_id = ?)",
-							rusqlite::params![video_id],
-							|row| row.get::<_, bool>(0),
-						).unwrap()
-					};
+				request = request_receiver.recv() => {
+					let connection = connection.clone();
+					let audio_download_notify = audio_download_notify.clone();
+					let youtube_download_request_sender = audio_download_request_sender.clone();
+					let audio_reference_count = audio_reference_count.clone();
+					let drop_sender = drop_sender.clone();
+					tokio::spawn(async move {
+						let (response_sender, video_id) = request.unwrap();
+						dbg!(&video_id);
 
-					// check if it exists
-					// if it doesn't, send a request to the downloader
-					// probably add 1 to its use count
+						let audio_downloaded = {
+							connection.lock().await.query_row(
+								"SELECT EXISTS (SELECT 1 FROM Audio WHERE video_id = ?)",
+								rusqlite::params![video_id],
+								|row| row.get::<_, bool>(0),
+							).unwrap()
+						};
+					
+						let final_filename = format!("{}.mp3", &video_id);
+						let final_path = std::path::Path::new(".")
+							.join(AUDIO_CACHE_PATH.as_os_str())
+							.join(&final_filename);
+						
+						let mut update_last_accessed_timestamp = true;
+						
+						if !audio_downloaded {
+							let mut audio_download_notify = audio_download_notify.lock().await;
+							if let Some(notify) = audio_download_notify.get(&video_id) {
+								let notify = notify.clone();
+								std::mem::drop(audio_download_notify);
+								notify.notified().await;
+							} else {
+								update_last_accessed_timestamp = false;
+								
+								let notify = Arc::new(Notify::new());
+								audio_download_notify.insert(video_id.clone(), notify.clone());
+								std::mem::drop(audio_download_notify);
+								
+								let (response_sender, response_receiver) = oneshot::channel();
+								youtube_download_request_sender.send((
+									response_sender,
+									video_id.clone(),
+								)).unwrap();
+								
+								match response_receiver.await.unwrap() {
+									Ok(response_path) => {
+										let metadata = std::fs::metadata(&response_path).unwrap();
+										
+										// NOTE: Audio should always be first added to the database, and only
+										// then moved to the directory, because in case the program is
+										// unexpectedely stopped, it will only delete database entries without
+										// corresponding audio files (and not audio files without
+										// corresponding database entries).
+								
+										// Add audio to database.
+										connection.lock().await.execute(
+											"INSERT INTO Audio (video_id, size, last_accessed_timestamp) VALUES (?, ?, ?)",
+											rusqlite::params![video_id, metadata.len(), chrono::Utc::now()],
+										).unwrap();
+
+										// Move audio to cache.
+										std::fs::rename(&response_path, &final_path).unwrap();
+									}
+									Err(err) => {
+										// TODO: log
+										// TODO: broadcast to all waiters that download failed
+									}
+								}
+								
+								notify.notify_waiters();
+							}
+						}
+						
+						if update_last_accessed_timestamp {
+							connection.lock().await.execute(
+								"UPDATE Audio SET last_accessed_timestamp = ? WHERE video_id = ?",
+								rusqlite::params![chrono::Utc::now(), video_id],
+							).unwrap();
+						}
+						
+						{
+							let mut audio_reference_count = audio_reference_count.lock().await;
+							// Inefficient entry api :(.
+							let references = audio_reference_count.entry(video_id.clone()).or_insert(0);
+							*references += 1;
+							std::mem::drop(audio_reference_count);
+						}
+						
+						let result = response_sender.send(
+							CachedAudioFile {
+								file: std::fs::File::open(final_path).unwrap(),
+								drop_sender,
+								video_id,
+							}
+						);
+						
+						if let Err(_) = result {
+							// TODO: log.
+						}
+					});
 				}
 
 				video_id = drop_receiver.recv() => {
 					let video_id = video_id.unwrap();
-					let references = audio_thingie.get_mut(&video_id).unwrap();
+					let mut audio_reference_count = audio_reference_count.lock().await;
+					let references = audio_reference_count.get_mut(&video_id).unwrap();
 					*references -= 1;
 					if *references == 0 {
-						audio_thingie.remove(&video_id);
+						audio_reference_count.remove(&video_id);
 					}
 				}
 			}
 			
-			// run code that tries to clean up stuff
+			// Clean up cache.
+			#[derive(Debug)]
+			struct Audio {
+				video_id: String,
+				size: u64,
+			}
+		
+			let mut audios: Vec<_> = {
+				let connection = connection.lock().await;
+				let mut statement = connection.prepare(
+					"SELECT video_id, size FROM Audio ORDER BY last_accessed_timestamp"
+				).unwrap();
+
+				let rows = statement.query_map(
+					rusqlite::params![],
+					|row| Ok(
+						Audio {
+							video_id: row.get(0)?,
+							size: row.get(1)?}),
+				).unwrap();
+
+				let rows = rows.map(|row| row.unwrap()).collect();
+				std::mem::drop(statement);
+				std::mem::drop(connection);
+				rows
+			};
+			
+			let audio_reference_count = audio_reference_count.lock().await;
+			audios.retain(|audio| !audio_reference_count.contains_key(&audio.video_id));
+			
+			let mut audio_cache_size: u64 = audios.iter().map(|audio| audio.size).sum();
+		
+			if audio_cache_size > app_config.audio_cache_size {
+				while !audios.is_empty()
+					&& audio_cache_size > app_config.audio_cache_size
+				{
+					let audio = audios.pop().unwrap();
+					let audio_path = video_id_to_audio_path(audio.video_id);
+					audio_cache_size -= audio.size;
+					std::fs::remove_file(&audio_path).unwrap();
+				}
+			}
+
+			std::mem::drop(audio_reference_count);
 		}
-		
-		// give out references to files
-		// keep track of how many references are currently out for any given file
-		// when a file has just been added, or a file has gone from having references, to having no references
-		// try to clean up the files (if you have to)
-		
-		// dictionary: video_id -> mutex with the count
 	}
 }
 
 #[tokio::main]
 async fn main() {
-	// console_subscriber::init();
-	
 	let args = Args::parse();
 	
 	let youtube_secret = google_youtube3::oauth2::read_service_account_key(args.youtube_secret_path).await.unwrap();
 	
 	std::env::set_current_dir(args.working_dir).unwrap();
-	std::fs::create_dir_all(std::path::Path::new(".").join(audio_download::AUDIO_TMP_PATH.as_os_str())).unwrap();
-	std::fs::create_dir_all(std::path::Path::new(".").join(audio_download::AUDIO_CACHE_PATH.as_os_str())).unwrap();
+
+	// NOTE: It should theoretically be possible to replace a lot of the Arcs in
+	// this code with immutable references, but I think that rust async is not good
+	// enough for that to work yet.
 	
 	let app_config = AppConfig {
 		audio_cache_size: 1024 * 1024 * 100,
 		domain: String::from("192.168.1.139"),
 		youtube_update_delay: chrono::Duration::minutes(15),
 	};
-	let app_config2 = app_config.clone();
-	let app_config3 = app_config.clone();
-	let app_config4 = app_config.clone();
-	
-	let (audio_request_sender, audio_request_receiver) = tokio::sync::mpsc::unbounded_channel();
+	let app_config = Arc::new(app_config);
+
+	let (audio_download_request_sender, audio_download_request_receiver) = tokio::sync::mpsc::unbounded_channel();
+	let (audio_cache_request_sender, audio_cache_request_receiver) = tokio::sync::mpsc::unbounded_channel();
 	let (youtube_data_request_sender, youtube_data_request_receiver) = tokio::sync::mpsc::unbounded_channel();
 	
-	// NOTE: It should theoretically be possible to have an immutable
-	// reference instead of an Arc, but I couldn't figure it out.
-	
-	{
-		// app.test("UC3cpN6gcJQqcCM6mxRUo_dA").await;
-		// app.update_channel_data("UC3cpN6gcJQqcCM6mxRUo_dA").await;
-	}
-	
 	let make_service = {
-		let audio_request_sender = audio_request_sender.clone();
+		let audio_request_sender = audio_cache_request_sender.clone();
 		let youtube_data_request_sender = youtube_data_request_sender.clone();
-		let app_config4 = app_config4.clone();
+		let app_config = app_config.clone();
 		hyper::service::make_service_fn(move |_conn: &hyper::server::conn::AddrStream| {
 			let audio_request_sender = audio_request_sender.clone();
 			let youtube_data_request_sender = youtube_data_request_sender.clone();
-			let app_config4 = app_config4.clone();
+			let app_config = app_config.clone();
 			async move {
 				anyhow::Ok(
 					hyper::service::service_fn(move |request| {
 						let audio_request_sender = audio_request_sender.clone();
 						let youtube_data_request_sender = youtube_data_request_sender.clone();
-						let app_config4 = app_config4.clone();
+						let app_config = app_config.clone();
 						println!("got a request!");
 						web::server(
-							app_config4,
+							app_config,
 							audio_request_sender,
 							youtube_data_request_sender,
 							request,
@@ -843,15 +1078,20 @@ async fn main() {
 		async {
 			let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 3000));
 			let server = hyper::Server::bind(&addr).serve(make_service);
-			let result = server.await;
-			dbg!(result);
+			let result = server.await.unwrap();
 		},
 		audio_download::server(
-			app_config2,
-			audio_request_receiver,
+			app_config.clone(),
+			audio_download_request_receiver,
 		),
+		audio_cache::server(
+			app_config.clone(),
+			audio_cache_request_receiver,
+			audio_download_request_sender,
+		),
+		// TODO: Get highest quality channel picture.
 		youtube_data::server(
-			app_config3,
+			app_config.clone(),
 			youtube_secret,
 			youtube_data_request_receiver,
 		),
