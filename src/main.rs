@@ -103,11 +103,13 @@ mod web {
 							xml::writer::XmlEvent::characters("no")
 						)
 					)?;
-					writer.nest(
-						xml::writer::XmlEvent::start_element("itunes:image")
-							.attr(xml::name::Name::local("href"), &channel.image_url),
-						|_| Ok(())
-					)?;
+					if let Some(image_url) = &channel.image_url {
+						writer.nest(
+							xml::writer::XmlEvent::start_element("itunes:image")
+								.attr(xml::name::Name::local("href"), image_url),
+							|_| Ok(())
+						)?;
+					}
 					
 					// Items
 					for video in channel.videos {
@@ -301,7 +303,7 @@ mod youtube_data {
 	pub struct Channel {
 		pub username: String,
 		pub description: String,
-		pub image_url: String,
+		pub image_url: Option<String>,
 		pub videos: Vec<Video>,
 	}
 	
@@ -393,7 +395,7 @@ mod youtube_data {
 				struct ChannelMetadata {
 					username: String,
 					description: String,
-					image_url: String,
+					image_url: Option<String>,
 				}
 
 				let channel_metadata = {
@@ -574,6 +576,7 @@ mod youtube_data {
 			
 			let channel = &items[0];
 			let snippet = channel.snippet.as_ref().unwrap();
+			let thumbnails = snippet.thumbnails.as_ref().unwrap();
 			let content_details = channel.content_details.as_ref().unwrap();
 
 			let playlist_id = {
@@ -588,10 +591,10 @@ mod youtube_data {
 					channel.id.as_ref().unwrap(),
 					snippet.title,
 					snippet.description,
-					snippet
-						.thumbnails.as_ref().unwrap()
-						.default.as_ref().unwrap()
-						.url.as_ref().unwrap(),
+					thumbnails.high.as_ref()
+						.or(thumbnails.medium.as_ref())
+						.or(thumbnails.standard.as_ref())
+						.map(|thumbnail| thumbnail.url.as_ref().unwrap()),
 					chrono::Utc::now(),
 				],
 			).unwrap();
@@ -620,13 +623,12 @@ mod youtube_data {
 					}).unwrap()
 				};
 				
-				dbg!(&results.next_page_token);
-				dbg!(results.items.as_ref().unwrap().len());
 				page_token = results.next_page_token;
-				
+			
 				let items = results.items.unwrap();
 				for item in items.iter() {
 					let snippet = item.snippet.as_ref().unwrap();
+					let thumbnails = snippet.thumbnails.as_ref().unwrap();
 					let result = transaction.execute(
 						"INSERT INTO Video (id, channel_id, name, description, image_url, published_timestamp) VALUES (?, ?, ?, ?, ?, ?)",
 						rusqlite::params![
@@ -634,10 +636,10 @@ mod youtube_data {
 							snippet.channel_id.as_ref().unwrap(),
 							snippet.title.as_ref().unwrap(),
 							snippet.description.as_ref().unwrap(),
-							snippet
-								.thumbnails.as_ref().unwrap()
-								.default.as_ref().unwrap()
-								.url.as_ref().unwrap(),
+							thumbnails.high.as_ref()
+								.or(thumbnails.medium.as_ref())
+								.or(thumbnails.standard.as_ref())
+								.map(|thumbnail| thumbnail.url.as_ref().unwrap()),
 							snippet.published_at.as_ref().unwrap(),
 						],
 					);
@@ -705,7 +707,6 @@ mod audio_download {
 						.join(AUDIO_OUTPUT_PATH.as_os_str())
 						.join(&audio_filename);
 			
-					// TODO: Delete the tmp_path if the command fails.
 					// TODO: Log stdout and stderr.
 			
 					let tmp_path = std::path::Path::new(".")
@@ -716,8 +717,8 @@ mod audio_download {
 						.join(&audio_filename);
 					
 					// Run command to download audio.
-					dbg!("starting command");
-					let output = {
+					let output = async_log::span!(
+						"running command to download video, video_id={}", &video_id, {
 						tokio::process::Command::new("yt-dlp")
 							.stdin(std::process::Stdio::null())
 							.arg(format!("https://www.youtube.com/watch?v={video_id}"))
@@ -733,7 +734,7 @@ mod audio_download {
 							.arg("-o")
 								.arg(&audio_filename)
 							.output().await.unwrap()
-					};
+					});
 			
 					let success = output.status.success();
 
@@ -790,6 +791,7 @@ mod audio_cache {
 		audio_path
 	}
 	
+	// TODO: test to make sure that the reference-counting works correctly.
 	pub async fn server(
 		app_config: Arc<crate::AppConfig>,
 		mut request_receiver: tokio::sync::mpsc::UnboundedReceiver<(tokio::sync::oneshot::Sender<CachedAudioFile>, String)>,
@@ -840,7 +842,7 @@ mod audio_cache {
 				};
 				if !file_exists {
 					transaction.execute(
-						"DELETE FROM Audio WHERE audio_id = ?",
+						"DELETE FROM Audio WHERE video_id = ?",
 						rusqlite::params![video_id],
 					).unwrap();
 				}
@@ -870,7 +872,6 @@ mod audio_cache {
 					let drop_sender = drop_sender.clone();
 					tokio::spawn(async move {
 						let (response_sender, video_id) = request.unwrap();
-						dbg!(&video_id);
 
 						let audio_downloaded = {
 							connection.lock().await.query_row(
@@ -926,7 +927,7 @@ mod audio_cache {
 										std::fs::rename(&response_path, &final_path).unwrap();
 									}
 									Err(err) => {
-										// TODO: log
+										log::error!("failed to download youtube video audio {err:?}");
 										// TODO: broadcast to all waiters that download failed
 									}
 								}
@@ -982,8 +983,8 @@ mod audio_cache {
 				size: u64,
 			}
 		
+			let connection = connection.lock().await;
 			let mut audios: Vec<_> = {
-				let connection = connection.lock().await;
 				let mut statement = connection.prepare(
 					"SELECT video_id, size FROM Audio ORDER BY last_accessed_timestamp"
 				).unwrap();
@@ -998,7 +999,6 @@ mod audio_cache {
 
 				let rows = rows.map(|row| row.unwrap()).collect();
 				std::mem::drop(statement);
-				std::mem::drop(connection);
 				rows
 			};
 			
@@ -1012,11 +1012,16 @@ mod audio_cache {
 					&& audio_cache_size > app_config.audio_cache_size
 				{
 					let audio = audios.pop().unwrap();
-					let audio_path = video_id_to_audio_path(audio.video_id);
+					let audio_path = video_id_to_audio_path(&audio.video_id);
 					audio_cache_size -= audio.size;
 					std::fs::remove_file(&audio_path).unwrap();
+					connection.execute(
+						"DELETE FROM Audio WHERE video_id = ?",
+						rusqlite::params![audio.video_id],
+					).unwrap();
 				}
 			}
+			std::mem::drop(connection);
 
 			std::mem::drop(audio_reference_count);
 		}
@@ -1060,7 +1065,7 @@ async fn main() {
 						let audio_request_sender = audio_request_sender.clone();
 						let youtube_data_request_sender = youtube_data_request_sender.clone();
 						let app_config = app_config.clone();
-						println!("got a request!");
+						log::info!("received an http request");
 						web::server(
 							app_config,
 							audio_request_sender,
@@ -1073,7 +1078,6 @@ async fn main() {
 		})
 	};
 	
-	// let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3000));
 	tokio::join! {
 		async {
 			let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 3000));
@@ -1089,7 +1093,6 @@ async fn main() {
 			audio_cache_request_receiver,
 			audio_download_request_sender,
 		),
-		// TODO: Get highest quality channel picture.
 		youtube_data::server(
 			app_config.clone(),
 			youtube_secret,
