@@ -1,19 +1,40 @@
-use std::sync::Arc;
+use std::{sync::Arc, io::Read};
 
 use clap::Parser;
 
 #[derive(Debug, clap::Parser)]
 struct Args {
 	#[arg(long)]
-	youtube_secret_path: std::path::PathBuf,
-	#[arg(long)]
-	working_dir: std::path::PathBuf,
+	config_path: std::path::PathBuf,
+	#[arg(long, default_value_t = log::Level::Error)]
+	log: log::Level,
 }
 
-#[derive(Clone)]
-pub struct AppConfig {
+// NOTE: This is quite ugly, I know, it's not great that I used unwrap here, but
+// I just sorta wanna be done already :).
+
+fn deserialize_duration<'de, D>(deserializer: D) -> Result<chrono::Duration, D::Error> where D: serde::Deserializer<'de> {
+	serde_humanize_rs::deserialize::<std::time::Duration, D>(deserializer)
+		.map(|duration| chrono::Duration::from_std(duration).unwrap())
+}
+
+fn deserialize_size<'de, D>(deserializer: D) -> Result<u64, D::Error> where D: serde::Deserializer<'de> {
+	serde_humanize_rs::deserialize::<usize, D>(deserializer)
+		.map(|size| size.try_into().unwrap())
+}
+
+#[derive(serde::Deserialize)]
+pub struct Config {
+	ip: std::net::Ipv4Addr,
+	port: u16,
+
+	working_dir: std::path::PathBuf,
+	youtube_secret_path: std::path::PathBuf,
+	
 	host: String,
+	#[serde(deserialize_with = "deserialize_size")]
 	audio_cache_size: u64,
+	#[serde(deserialize_with = "deserialize_duration")]
 	youtube_update_delay: chrono::Duration,
 }
 
@@ -54,7 +75,7 @@ mod web {
 	}
 
 	async fn get_feed(
-		app_config: Arc<crate::AppConfig>,
+		config: Arc<crate::Config>,
 		youtube_data_request_sender: mpsc::UnboundedSender<(oneshot::Sender<crate::youtube_data::Channel>, crate::youtube_data::ChannelIdentifier)>,
 		channel_identifier: &crate::youtube_data::ChannelIdentifier,
 	) -> String {
@@ -163,7 +184,7 @@ mod web {
 									)
 								)?;
 								
-								let host = &app_config.host;
+								let host = &config.host;
 								let enclosure_href = format!("http://{host}:3000/audio/{video_id}.mp3");
 								
 								writer.nest(
@@ -206,7 +227,7 @@ mod web {
 	}
 
 	pub async fn server(
-		config: Arc<crate::AppConfig>,
+		config: Arc<crate::Config>,
 		audio_cache_request_sender: mpsc::UnboundedSender<(oneshot::Sender<Result<crate::audio_cache::CachedAudioFile, ()>>, String)>,
 		youtube_data_request_sender: mpsc::UnboundedSender<(oneshot::Sender<crate::youtube_data::Channel>, crate::youtube_data::ChannelIdentifier)>,
 		request: hyper::Request<hyper::Body>,
@@ -326,7 +347,7 @@ mod youtube_data {
 	}
 	
 	pub async fn server(
-		app_config: Arc<crate::AppConfig>,
+		config: Arc<crate::Config>,
 		youtube_secret: google_youtube3::oauth2::ServiceAccountKey,
 		mut request_receiver: tokio::sync::mpsc::UnboundedReceiver<(tokio::sync::oneshot::Sender<Channel>, ChannelIdentifier)>
 	) {
@@ -382,13 +403,13 @@ mod youtube_data {
 		while let Some((sender, channel_identifier)) = request_receiver.recv().await {
 			let connection = connection.clone();
 			let youtube_hub = youtube_hub.clone();
-			let app_config = app_config.clone();
+			let config = config.clone();
 			tokio::spawn(async move {
 				let mut connection = connection.lock().await;
 				
 				let channel_id = {
 					update_channel_data(
-						app_config.clone(),
+						config.clone(),
 						&mut connection,
 						&youtube_hub,
 						&channel_identifier,
@@ -450,7 +471,7 @@ mod youtube_data {
 	}
 	
 	async fn update_channel_data(
-		app_config: Arc<crate::AppConfig>,
+		config: Arc<crate::Config>,
 		connection: &mut rusqlite::Connection,
 		youtube_hub: &google_youtube3::YouTube<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
 		channel_identifier: &ChannelIdentifier,
@@ -513,7 +534,7 @@ mod youtube_data {
 			tokio::runtime::Handle::current(),
 			connection,
 			&youtube_hub,
-			app_config.youtube_update_delay,
+			config.youtube_update_delay,
 			&channel_id,
 		)
 			.map(|_| channel_id)
@@ -649,7 +670,14 @@ mod youtube_data {
 						],
 					);
 					
-					if let Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error { code: rusqlite::ffi::ErrorCode::ConstraintViolation, extended_code: rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY }, _)) = result {
+					// TODO: Extended_code should really be
+					// rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY, but for some reason that
+					// constant doesn't show up if I don't add the "bundled" feature in
+					// rusqlite.
+					//
+					// I really prefer not using "bundled" though, so for now I'll leave it
+					// like this. Hopefully in the future this gets fixed.
+					if let Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error { code: rusqlite::ffi::ErrorCode::ConstraintViolation, extended_code: _ }, _)) = result {
 						break 'downloading;
 					}
 					
@@ -685,7 +713,7 @@ mod audio_download {
 	}
 	
 	pub async fn server(
-		app_config: Arc<crate::AppConfig>,
+		config: Arc<crate::Config>,
 		mut request_receiver: mpsc::UnboundedReceiver<(oneshot::Sender<Result<PathBuf, Error>>, String)>,
 	) {
 		std::fs::remove_dir_all(std::path::Path::new(".").join(AUDIO_TMP_PATH.as_os_str())).unwrap();
@@ -796,7 +824,7 @@ mod audio_cache {
 	
 	// TODO: test to make sure that the reference-counting works correctly.
 	pub async fn server(
-		app_config: Arc<crate::AppConfig>,
+		config: Arc<crate::Config>,
 		mut request_receiver: tokio::sync::mpsc::UnboundedReceiver<(tokio::sync::oneshot::Sender<Result<CachedAudioFile, ()>>, String)>,
 		audio_download_request_sender: mpsc::UnboundedSender<(oneshot::Sender<Result<PathBuf, crate::audio_download::Error>>, String)>,
 	) {
@@ -1014,9 +1042,9 @@ mod audio_cache {
 			
 			let mut audio_cache_size: u64 = audios.iter().map(|audio| audio.size).sum();
 		
-			if audio_cache_size > app_config.audio_cache_size {
+			if audio_cache_size > config.audio_cache_size {
 				while !audios.is_empty()
-					&& audio_cache_size > app_config.audio_cache_size
+					&& audio_cache_size > config.audio_cache_size
 				{
 					let audio = audios.pop().unwrap();
 					let audio_path = video_id_to_audio_path(&audio.video_id);
@@ -1039,24 +1067,27 @@ mod audio_cache {
 // It would be good if the program were able to refersh the whole video catalog
 // every once in a while.
 
+// NOTE: It should theoretically be possible to replace a lot of the Arcs in
+// this code with immutable references, but I think that rust async is not good
+// enough for that to work yet.
+
 #[tokio::main]
 async fn main() {
 	let args = Args::parse();
 	
-	let youtube_secret = google_youtube3::oauth2::read_service_account_key(args.youtube_secret_path).await.unwrap();
+	simple_logger::init_with_level(args.log).unwrap();
 	
-	std::env::set_current_dir(args.working_dir).unwrap();
-
-	// NOTE: It should theoretically be possible to replace a lot of the Arcs in
-	// this code with immutable references, but I think that rust async is not good
-	// enough for that to work yet.
-	
-	let app_config = AppConfig {
-		audio_cache_size: 1024 * 1024 * 100,
-		host: String::from("192.168.1.139"),
-		youtube_update_delay: chrono::Duration::minutes(15),
+	let config: Config = {
+		let mut file = std::fs::File::open(&args.config_path).unwrap();
+		let mut contents = String::new();
+		file.read_to_string(&mut contents).unwrap();
+		toml::from_str(&contents).unwrap()
 	};
-	let app_config = Arc::new(app_config);
+	let config = Arc::new(config);
+	
+	let youtube_secret = google_youtube3::oauth2::read_service_account_key(&config.youtube_secret_path).await.unwrap();
+	
+	std::env::set_current_dir(&config.working_dir).unwrap();
 
 	let (audio_download_request_sender, audio_download_request_receiver) = tokio::sync::mpsc::unbounded_channel();
 	let (audio_cache_request_sender, audio_cache_request_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -1065,20 +1096,20 @@ async fn main() {
 	let make_service = {
 		let audio_request_sender = audio_cache_request_sender.clone();
 		let youtube_data_request_sender = youtube_data_request_sender.clone();
-		let app_config = app_config.clone();
+		let config = config.clone();
 		hyper::service::make_service_fn(move |_conn: &hyper::server::conn::AddrStream| {
 			let audio_request_sender = audio_request_sender.clone();
 			let youtube_data_request_sender = youtube_data_request_sender.clone();
-			let app_config = app_config.clone();
+			let config = config.clone();
 			async move {
 				anyhow::Ok(
 					hyper::service::service_fn(move |request| {
 						let audio_request_sender = audio_request_sender.clone();
 						let youtube_data_request_sender = youtube_data_request_sender.clone();
-						let app_config = app_config.clone();
+						let config = config.clone();
 						log::info!("received an http request");
 						web::server(
-							app_config,
+							config,
 							audio_request_sender,
 							youtube_data_request_sender,
 							request,
@@ -1091,21 +1122,21 @@ async fn main() {
 	
 	tokio::join! {
 		async {
-			let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 3000));
-			let server = hyper::Server::bind(&addr).serve(make_service);
+			let address = std::net::SocketAddr::from((config.ip, config.port));
+			let server = hyper::Server::bind(&address).serve(make_service);
 			let result = server.await.unwrap();
 		},
 		audio_download::server(
-			app_config.clone(),
+			config.clone(),
 			audio_download_request_receiver,
 		),
 		audio_cache::server(
-			app_config.clone(),
+			config.clone(),
 			audio_cache_request_receiver,
 			audio_download_request_sender,
 		),
 		youtube_data::server(
-			app_config.clone(),
+			config.clone(),
 			youtube_secret,
 			youtube_data_request_receiver,
 		),
