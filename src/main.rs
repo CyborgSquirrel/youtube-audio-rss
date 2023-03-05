@@ -12,13 +12,15 @@ struct Args {
 
 #[derive(Clone)]
 pub struct AppConfig {
-	domain: String,
+	host: String,
 	audio_cache_size: u64,
 	youtube_update_delay: chrono::Duration,
 }
 
 mod web {
     use std::{io::Read, sync::Arc};
+
+    use tokio::sync::{mpsc, oneshot};
 
 	trait EventWriterExt {
 		fn nest<'a, F>(
@@ -53,7 +55,7 @@ mod web {
 
 	async fn get_feed(
 		app_config: Arc<crate::AppConfig>,
-		youtube_data_request_sender: tokio::sync::mpsc::UnboundedSender<(tokio::sync::oneshot::Sender<crate::youtube_data::Channel>, crate::youtube_data::ChannelIdentifier)>,
+		youtube_data_request_sender: mpsc::UnboundedSender<(oneshot::Sender<crate::youtube_data::Channel>, crate::youtube_data::ChannelIdentifier)>,
 		channel_identifier: &crate::youtube_data::ChannelIdentifier,
 	) -> String {
 		// TODO: Maybe add some of the following tags:
@@ -61,7 +63,7 @@ mod web {
 		// itunes:duration
 		// itunes:explicit
 		
-		let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+		let (response_sender, response_receiver) = oneshot::channel();
 		youtube_data_request_sender.send((
 			response_sender,
 			channel_identifier.clone(),
@@ -161,8 +163,8 @@ mod web {
 									)
 								)?;
 								
-								let domain = &app_config.domain;
-								let enclosure_href = format!("http://{domain}:3000/audio/{video_id}.mp3");
+								let host = &app_config.host;
+								let enclosure_href = format!("http://{host}:3000/audio/{video_id}.mp3");
 								
 								writer.nest(
 									xml::writer::XmlEvent::start_element("enclosure")
@@ -201,38 +203,51 @@ mod web {
 		let string = std::str::from_utf8(bytes.as_slice()).unwrap();
 		
 		String::from(string)
-	}	
+	}
 
 	pub async fn server(
 		config: Arc<crate::AppConfig>,
-		audio_cache_request_sender: tokio::sync::mpsc::UnboundedSender<(tokio::sync::oneshot::Sender<crate::audio_cache::CachedAudioFile>, String)>,
-		youtube_data_request_sender: tokio::sync::mpsc::UnboundedSender<(tokio::sync::oneshot::Sender<crate::youtube_data::Channel>, crate::youtube_data::ChannelIdentifier)>,
+		audio_cache_request_sender: mpsc::UnboundedSender<(oneshot::Sender<Result<crate::audio_cache::CachedAudioFile, ()>>, String)>,
+		youtube_data_request_sender: mpsc::UnboundedSender<(oneshot::Sender<crate::youtube_data::Channel>, crate::youtube_data::ChannelIdentifier)>,
 		request: hyper::Request<hyper::Body>,
 	) -> anyhow::Result<hyper::Response<hyper::Body>> {
+		fn error_response(error: hyper::StatusCode) -> hyper::Response<hyper::Body> {
+			hyper::Response::builder()
+				.status(error)
+				.body(hyper::Body::from(Vec::new()))
+				.unwrap()
+		}
+		
 		let path = std::path::Path::new(request.uri().path());
 		if let &hyper::Method::GET = request.method() {
 			if let Some(parent) = path.parent().map(|parent| parent.as_os_str()).and_then(|parent| parent.to_str()) {
 				match parent {
 					"/audio" => {
-						assert!(matches!(path.extension().and_then(|extension| extension.to_str()), Some("mp3")));
-						let video_id = path.file_stem().unwrap().to_str().unwrap();
+						if let Some("mp3") = path.extension().and_then(|extension| extension.to_str()) {
+							let video_id = path.file_stem().unwrap().to_str().unwrap();
 
-						let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
-						audio_cache_request_sender.send((
-							response_sender,
-							String::from(video_id),
-						)).unwrap();
+							let (response_sender, response_receiver) = oneshot::channel();
+							audio_cache_request_sender.send((
+								response_sender,
+								String::from(video_id),
+							)).unwrap();
 		
-						let mut cached_audio_file = response_receiver.await.unwrap();
+							let cached_audio_file = response_receiver.await.unwrap();
 
-						let mut audio = Vec::new();
-						cached_audio_file.file_mut().read_to_end(&mut audio).unwrap();
-						anyhow::Ok(
-							hyper::Response::builder()
-								.header(hyper::header::CONTENT_TYPE, "audio/mp3")
-								.body(hyper::Body::from(audio))
-								.unwrap()
-						)
+							if let Ok(mut cached_audio_file) = cached_audio_file {
+								let mut audio = Vec::new();
+								cached_audio_file.file_mut().read_to_end(&mut audio).unwrap();
+								anyhow::Ok(
+									hyper::Response::builder()
+										.header(hyper::header::CONTENT_TYPE, "audio/mp3")
+										.body(hyper::Body::from(audio))
+										.unwrap())
+							} else {
+								anyhow::Ok(error_response(hyper::StatusCode::INTERNAL_SERVER_ERROR))
+							}
+						} else {
+							anyhow::Ok(error_response(hyper::StatusCode::NOT_FOUND))
+						}
 					}
 					"/feed/channel_id" => {
 						let channel_id = path
@@ -269,26 +284,14 @@ mod web {
 						)
 					}
 					_ => {
-						Ok(
-							hyper::Response::builder()
-								.status(hyper::StatusCode::NOT_FOUND)
-								.body(hyper::Body::from(Vec::new()))
-								.unwrap())
+						anyhow::Ok(error_response(hyper::StatusCode::NOT_FOUND))
 					}
 				}
 			} else {
-				Ok(
-					hyper::Response::builder()
-						.status(hyper::StatusCode::NOT_FOUND)
-						.body(hyper::Body::from(Vec::new()))
-						.unwrap())
+				anyhow::Ok(error_response(hyper::StatusCode::NOT_FOUND))
 			}
 		} else {
-			Ok(
-				hyper::Response::builder()
-					.status(hyper::StatusCode::NOT_FOUND)
-					.body(hyper::Body::from(Vec::new()))
-					.unwrap())
+			anyhow::Ok(error_response(hyper::StatusCode::NOT_FOUND))
 		}
 	}
 }
@@ -494,11 +497,13 @@ mod youtube_data {
 						
 						let regex_source = r#"<link rel="alternate" type="application/rss[+]xml" title="RSS" href="https://www[.]youtube[.]com/feeds/videos[.]xml[?]channel_id=([^"]*)">"#;
 						let regex = regex::RegexBuilder::new(regex_source).build().unwrap();
-						let channel_id = regex.captures(text).unwrap()
-							.get(1).unwrap()
-							.as_str().to_string();
-					
-						channel_id
+						let channel_id = regex.captures(text).map(|capture| capture.get(1).unwrap().as_str().to_string());
+						
+						if let Some(channel_id) = channel_id {
+							channel_id
+						} else {
+							todo!()
+						}
 					}
 				}
 			}
@@ -605,7 +610,7 @@ mod youtube_data {
 				let (_, results) = {
 					let request = {
 						youtube_hub.playlist_items()
-							.list(&vec!["id".to_string(), "snippet".to_string(), "contentDetails".to_string()])
+							.list(&vec!["id".to_string(), "snippet".to_string()])
 							.playlist_id(&playlist_id)
 							.max_results(50)
 					};
@@ -707,8 +712,6 @@ mod audio_download {
 						.join(AUDIO_OUTPUT_PATH.as_os_str())
 						.join(&audio_filename);
 			
-					// TODO: Log stdout and stderr.
-			
 					let tmp_path = std::path::Path::new(".")
 						.join(AUDIO_TMP_PATH.as_os_str())
 						.join(&video_id);
@@ -761,12 +764,12 @@ mod audio_download {
 mod audio_cache {
     use std::{sync::Arc, collections::HashMap, path::PathBuf};
 
-    use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+    use tokio::sync::{Mutex, mpsc, oneshot, broadcast};
 
 	lazy_static::lazy_static! {
 		static ref AUDIO_CACHE_PATH: &'static std::path::Path = std::path::Path::new("./audio_cache");
 	}
-
+	
 	#[derive(Debug)]
 	pub struct CachedAudioFile {
 		drop_sender: tokio::sync::mpsc::UnboundedSender<String>,
@@ -794,7 +797,7 @@ mod audio_cache {
 	// TODO: test to make sure that the reference-counting works correctly.
 	pub async fn server(
 		app_config: Arc<crate::AppConfig>,
-		mut request_receiver: tokio::sync::mpsc::UnboundedReceiver<(tokio::sync::oneshot::Sender<CachedAudioFile>, String)>,
+		mut request_receiver: tokio::sync::mpsc::UnboundedReceiver<(tokio::sync::oneshot::Sender<Result<CachedAudioFile, ()>>, String)>,
 		audio_download_request_sender: mpsc::UnboundedSender<(oneshot::Sender<Result<PathBuf, crate::audio_download::Error>>, String)>,
 	) {
 		// Set up database.
@@ -854,7 +857,7 @@ mod audio_cache {
 
 		let (drop_sender, mut drop_receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
 		let audio_reference_count: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
-		let audio_download_notify: Arc<Mutex<HashMap<String, Arc<Notify>>>> = Arc::new(Mutex::new(HashMap::new()));
+		let audio_available_notify: Arc<Mutex<HashMap<String, broadcast::Sender<bool>>>> = Arc::new(Mutex::new(HashMap::new()));
 		
 		loop {
 			tokio::select! {
@@ -866,7 +869,7 @@ mod audio_cache {
 
 				request = request_receiver.recv() => {
 					let connection = connection.clone();
-					let audio_download_notify = audio_download_notify.clone();
+					let audio_download_notify = audio_available_notify.clone();
 					let youtube_download_request_sender = audio_download_request_sender.clone();
 					let audio_reference_count = audio_reference_count.clone();
 					let drop_sender = drop_sender.clone();
@@ -887,36 +890,36 @@ mod audio_cache {
 							.join(&final_filename);
 						
 						let mut update_last_accessed_timestamp = true;
+						let mut audio_available = true;
 						
 						if !audio_downloaded {
 							let mut audio_download_notify = audio_download_notify.lock().await;
-							if let Some(notify) = audio_download_notify.get(&video_id) {
-								let notify = notify.clone();
+							if let Some(mut receiver) = audio_download_notify.get(&video_id).map(|sender| sender.subscribe()) {
 								std::mem::drop(audio_download_notify);
-								notify.notified().await;
+								audio_available = receiver.recv().await.unwrap();
 							} else {
 								update_last_accessed_timestamp = false;
-								
-								let notify = Arc::new(Notify::new());
-								audio_download_notify.insert(video_id.clone(), notify.clone());
+							
+								let (broadcast_sender, _) = broadcast::channel(1);
+								audio_download_notify.insert(video_id.clone(), broadcast_sender.clone());
 								std::mem::drop(audio_download_notify);
-								
+							
 								let (response_sender, response_receiver) = oneshot::channel();
 								youtube_download_request_sender.send((
 									response_sender,
 									video_id.clone(),
 								)).unwrap();
-								
+							
 								match response_receiver.await.unwrap() {
 									Ok(response_path) => {
 										let metadata = std::fs::metadata(&response_path).unwrap();
-										
+									
 										// NOTE: Audio should always be first added to the database, and only
 										// then moved to the directory, because in case the program is
 										// unexpectedely stopped, it will only delete database entries without
 										// corresponding audio files (and not audio files without
 										// corresponding database entries).
-								
+							
 										// Add audio to database.
 										connection.lock().await.execute(
 											"INSERT INTO Audio (video_id, size, last_accessed_timestamp) VALUES (?, ?, ?)",
@@ -928,39 +931,43 @@ mod audio_cache {
 									}
 									Err(err) => {
 										log::error!("failed to download youtube video audio {err:?}");
-										// TODO: broadcast to all waiters that download failed
+										audio_available = false;
 									}
-								}
-								
-								notify.notify_waiters();
+								};
+							
+								broadcast_sender.send(audio_available).unwrap();
 							}
 						}
 						
-						if update_last_accessed_timestamp {
-							connection.lock().await.execute(
-								"UPDATE Audio SET last_accessed_timestamp = ? WHERE video_id = ?",
-								rusqlite::params![chrono::Utc::now(), video_id],
-							).unwrap();
-						}
-						
-						{
-							let mut audio_reference_count = audio_reference_count.lock().await;
-							// Inefficient entry api :(.
-							let references = audio_reference_count.entry(video_id.clone()).or_insert(0);
-							*references += 1;
-							std::mem::drop(audio_reference_count);
-						}
-						
-						let result = response_sender.send(
-							CachedAudioFile {
-								file: std::fs::File::open(final_path).unwrap(),
-								drop_sender,
-								video_id,
+						if !audio_available {
+							let _ = response_sender.send(Err(()));
+						} else {
+							if update_last_accessed_timestamp {
+								connection.lock().await.execute(
+									"UPDATE Audio SET last_accessed_timestamp = ? WHERE video_id = ?",
+									rusqlite::params![chrono::Utc::now(), video_id],
+								).unwrap();
 							}
-						);
 						
-						if let Err(_) = result {
-							// TODO: log.
+							{
+								let mut audio_reference_count = audio_reference_count.lock().await;
+								// Inefficient entry api :(.
+								let references = audio_reference_count.entry(video_id.clone()).or_insert(0);
+								*references += 1;
+								std::mem::drop(audio_reference_count);
+							}
+						
+							let result = response_sender.send(
+								Ok(
+									CachedAudioFile {
+										file: std::fs::File::open(final_path).unwrap(),
+										drop_sender,
+										video_id})
+							);
+						
+							if let Err(_) = result {
+								log::error!("couldn't send audio file");
+							}
 						}
 					});
 				}
@@ -1028,6 +1035,10 @@ mod audio_cache {
 	}
 }
 
+// TODO: Sometimes a youtube channel will private/unlist some of their videos.
+// It would be good if the program were able to refersh the whole video catalog
+// every once in a while.
+
 #[tokio::main]
 async fn main() {
 	let args = Args::parse();
@@ -1042,7 +1053,7 @@ async fn main() {
 	
 	let app_config = AppConfig {
 		audio_cache_size: 1024 * 1024 * 100,
-		domain: String::from("192.168.1.139"),
+		host: String::from("192.168.1.139"),
 		youtube_update_delay: chrono::Duration::minutes(15),
 	};
 	let app_config = Arc::new(app_config);
