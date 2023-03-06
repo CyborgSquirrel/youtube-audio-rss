@@ -1067,6 +1067,14 @@ mod audio_cache {
 // It would be good if the program were able to refersh the whole video catalog
 // every once in a while.
 
+// TODO: Calculate the length of the videos, by subtracting the starting time
+// from the ending time (in the context of the all videos playlist). Normally,
+// this wouldn't be a 100% reliable way to get the length of a video, but I
+// think that in this case it will be perfect, because I'm pretty sure the all
+// videos playlist is auto-generated.
+
+// TODO: Pagination for the rss feed.
+
 // NOTE: It should theoretically be possible to replace a lot of the Arcs in
 // this code with immutable references, but I think that rust async is not good
 // enough for that to work yet.

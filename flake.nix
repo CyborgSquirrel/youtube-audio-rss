@@ -85,6 +85,7 @@
               serviceConfig = let
                 configFile = pkgs.writeText "config.toml" cfg.config;
               in {
+                WantedBy = [ "multi-user.target" ];
                 ExecStart = "${pkgs.lib.getExe packages.default} --config-path ${configFile} --log INFO";
                 Type = "exec";
                 StandardError = "journal";
