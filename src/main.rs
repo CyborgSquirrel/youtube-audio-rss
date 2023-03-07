@@ -707,8 +707,8 @@ mod audio_download {
     use tokio::sync::{mpsc, oneshot, Mutex};
 
 	lazy_static::lazy_static! {
-		static ref AUDIO_TMP_PATH: &'static std::path::Path = std::path::Path::new("audio_tmp");
-		static ref AUDIO_OUTPUT_PATH: &'static std::path::Path = std::path::Path::new("audio_output");
+		static ref AUDIO_TMP_PATH: &'static std::path::Path = std::path::Path::new("./audio_tmp");
+		static ref AUDIO_OUTPUT_PATH: &'static std::path::Path = std::path::Path::new("./audio_output");
 	}
 	
 	#[derive(Debug)]
@@ -721,11 +721,15 @@ mod audio_download {
 		config: Arc<crate::Config>,
 		mut request_receiver: mpsc::UnboundedReceiver<(oneshot::Sender<Result<PathBuf, Error>>, String)>,
 	) {
-		std::fs::remove_dir_all(std::path::Path::new(".").join(AUDIO_TMP_PATH.as_os_str())).unwrap();
-		std::fs::create_dir_all(std::path::Path::new(".").join(AUDIO_TMP_PATH.as_os_str())).unwrap();
+		if AUDIO_TMP_PATH.exists() {
+			std::fs::remove_dir_all(&*AUDIO_TMP_PATH).unwrap();
+		}
+		std::fs::create_dir_all(&*AUDIO_TMP_PATH).unwrap();
 
-		std::fs::remove_dir_all(std::path::Path::new(".").join(AUDIO_OUTPUT_PATH.as_os_str())).unwrap();
-		std::fs::create_dir_all(std::path::Path::new(".").join(AUDIO_OUTPUT_PATH.as_os_str())).unwrap();
+		if AUDIO_OUTPUT_PATH.exists() {
+			std::fs::remove_dir_all(&*AUDIO_OUTPUT_PATH).unwrap();
+		}
+		std::fs::create_dir_all(&*AUDIO_OUTPUT_PATH).unwrap();
 
 		let currently_downloading: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
@@ -741,13 +745,8 @@ mod audio_download {
 				tokio::spawn(async move {
 					let audio_filename = format!("{video_id}.mp3");
 
-					let audio_output_path = std::path::Path::new(".")
-						.join(AUDIO_OUTPUT_PATH.as_os_str())
-						.join(&audio_filename);
-			
-					let tmp_path = std::path::Path::new(".")
-						.join(AUDIO_TMP_PATH.as_os_str())
-						.join(&video_id);
+					let audio_output_path = AUDIO_OUTPUT_PATH.join(&audio_filename);
+					let tmp_path = AUDIO_TMP_PATH.join(&video_id);
 			
 					let audio_tmp_path = tmp_path
 						.join(&audio_filename);
@@ -864,18 +863,7 @@ mod audio_cache {
 			let transaction = connection.transaction().unwrap();
 			for video_id in video_ids {
 				let audio_path = video_id_to_audio_path(&video_id);
-				let metadata = std::fs::metadata(audio_path);
-				let file_exists = {
-					if let Err(err) = metadata {
-						if let std::io::ErrorKind::NotFound = err.kind() {
-							false
-						} else {
-							panic!();
-						}
-					} else {
-						true
-					}
-				};
+				let file_exists = audio_path.exists();
 				if !file_exists {
 					transaction.execute(
 						"DELETE FROM Audio WHERE video_id = ?",
@@ -1100,6 +1088,9 @@ async fn main() {
 	
 	let youtube_secret = google_youtube3::oauth2::read_service_account_key(&config.youtube_secret_path).await.unwrap();
 	
+	if !config.working_dir.exists() {
+		std::fs::create_dir_all(&config.working_dir).unwrap();
+	}
 	std::env::set_current_dir(&config.working_dir).unwrap();
 
 	let (audio_download_request_sender, audio_download_request_receiver) = tokio::sync::mpsc::unbounded_channel();
