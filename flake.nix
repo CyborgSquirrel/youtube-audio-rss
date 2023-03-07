@@ -84,10 +84,11 @@
           config = {
             systemd.services.youtube-audio-rss = lib.mkIf cfg.enable {
               description = "Convert youtube channels to podcasts.";
+              wantedBy = [ "multi-user.target" ];
               serviceConfig = let
                 configFile = pkgs.writeText "config.toml" cfg.config;
               in {
-                WantedBy = [ "multi-user.target" ];
+                Restart = "on-failure";
                 ExecStart = "${pkgs.lib.getExe packages.default} --config-path ${configFile} --log INFO";
                 Type = "exec";
                 StandardError = "journal";
