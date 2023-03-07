@@ -956,7 +956,8 @@ mod audio_cache {
 									}
 								};
 							
-								broadcast_sender.send(audio_available).unwrap();
+								// We don't care if there were any/no receivers for the broadcast.
+								let _ = broadcast_sender.send(audio_available);
 							}
 						}
 						
