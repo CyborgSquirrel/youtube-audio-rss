@@ -36,7 +36,8 @@ pub struct Config {
 	#[serde(deserialize_with = "deserialize_duration")]
 	youtube_update_delay: chrono::Duration,
 	
-	url_prefix: String,
+	url_scheme: String,
+	url_path_prefix: String,
 }
 
 mod web {
@@ -87,7 +88,8 @@ mod web {
 		// itunes:explicit
 		
 		let host = host.as_ref();
-		let url_prefix = &config.url_prefix;
+		let url_scheme = &config.url_scheme;
+		let url_path_prefix = &config.url_path_prefix;
 		
 		let (response_sender, response_receiver) = oneshot::channel();
 		youtube_data_request_sender.send((
@@ -189,7 +191,7 @@ mod web {
 									)
 								)?;
 								
-								let enclosure_href = format!("{url_prefix}{host}/audio/{video_id}.mp3");
+								let enclosure_href = format!("{url_scheme}://{host}{url_path_prefix}/audio/{video_id}.mp3");
 								
 								writer.nest(
 									xml::writer::XmlEvent::start_element("enclosure")

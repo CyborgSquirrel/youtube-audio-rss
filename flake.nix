@@ -76,7 +76,8 @@
                 audio_cache_size = "100M"
                 youtube_update_delay = "15m"
                 
-                url_prefix = "http://"
+                url_scheme = "http"
+                url_path_prefix = "/youtube_channel_podcast"
               '';
             };
           };
