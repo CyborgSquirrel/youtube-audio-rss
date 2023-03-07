@@ -75,6 +75,8 @@
 
                 audio_cache_size = "100M"
                 youtube_update_delay = "15m"
+                
+                url_prefix = "http://"
               '';
             };
           };

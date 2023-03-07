@@ -35,6 +35,8 @@ pub struct Config {
 	audio_cache_size: u64,
 	#[serde(deserialize_with = "deserialize_duration")]
 	youtube_update_delay: chrono::Duration,
+	
+	url_prefix: String,
 }
 
 mod web {
@@ -74,6 +76,7 @@ mod web {
 	}
 
 	async fn get_feed<T: AsRef<str>>(
+		config: Arc<crate::Config>,
 		youtube_data_request_sender: mpsc::UnboundedSender<(oneshot::Sender<crate::youtube_data::Channel>, crate::youtube_data::ChannelIdentifier)>,
 		channel_identifier: &crate::youtube_data::ChannelIdentifier,
 		host: T,
@@ -84,6 +87,7 @@ mod web {
 		// itunes:explicit
 		
 		let host = host.as_ref();
+		let url_prefix = &config.url_prefix;
 		
 		let (response_sender, response_receiver) = oneshot::channel();
 		youtube_data_request_sender.send((
@@ -185,7 +189,7 @@ mod web {
 									)
 								)?;
 								
-								let enclosure_href = format!("http://{host}/audio/{video_id}.mp3");
+								let enclosure_href = format!("{url_prefix}{host}/audio/{video_id}.mp3");
 								
 								writer.nest(
 									xml::writer::XmlEvent::start_element("enclosure")
@@ -286,6 +290,7 @@ mod web {
 						};
 
 						let feed = get_feed(
+							config,
 							youtube_data_request_sender,
 							&crate::youtube_data::ChannelIdentifier::Id(channel_id),
 							host,
@@ -307,6 +312,7 @@ mod web {
 						};
 
 						let feed = get_feed(
+							config,
 							youtube_data_request_sender,
 							&crate::youtube_data::ChannelIdentifier::CustomUrl(channel_custom_url),
 							host,
