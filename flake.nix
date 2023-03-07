@@ -73,7 +73,6 @@
                 working_dir = "/path/to/working_dir"
                 youtube_secret_path = "/path/to/youtube_secret.json"
 
-                host = "example.com"
                 audio_cache_size = "100M"
                 youtube_update_delay = "15m"
               '';

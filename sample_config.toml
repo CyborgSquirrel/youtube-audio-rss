@@ -4,8 +4,5 @@ port = 3000
 working_dir = "/home/andrei/yar"
 youtube_secret_path = "/home/andrei/youtube-audio-rss.json"
 
-test = "100 M"
-
-host = "192.168.1.139"
 audio_cache_size = "100M"
 youtube_update_delay = "15m"

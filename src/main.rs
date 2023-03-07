@@ -31,7 +31,6 @@ pub struct Config {
 	working_dir: std::path::PathBuf,
 	youtube_secret_path: std::path::PathBuf,
 	
-	host: String,
 	#[serde(deserialize_with = "deserialize_size")]
 	audio_cache_size: u64,
 	#[serde(deserialize_with = "deserialize_duration")]
@@ -74,15 +73,17 @@ mod web {
 		xml::name::Name::prefixed(local_name, prefix)
 	}
 
-	async fn get_feed(
-		config: Arc<crate::Config>,
+	async fn get_feed<T: AsRef<str>>(
 		youtube_data_request_sender: mpsc::UnboundedSender<(oneshot::Sender<crate::youtube_data::Channel>, crate::youtube_data::ChannelIdentifier)>,
 		channel_identifier: &crate::youtube_data::ChannelIdentifier,
+		host: T,
 	) -> String {
 		// TODO: Maybe add some of the following tags:
 		// itunes:author
 		// itunes:duration
 		// itunes:explicit
+		
+		let host = host.as_ref();
 		
 		let (response_sender, response_receiver) = oneshot::channel();
 		youtube_data_request_sender.send((
@@ -184,8 +185,7 @@ mod web {
 									)
 								)?;
 								
-								let host = &config.host;
-								let enclosure_href = format!("http://{host}:3000/audio/{video_id}.mp3");
+								let enclosure_href = format!("http://{host}/audio/{video_id}.mp3");
 								
 								writer.nest(
 									xml::writer::XmlEvent::start_element("enclosure")
@@ -238,48 +238,59 @@ mod web {
 				.body(hyper::Body::from(Vec::new()))
 				.unwrap()
 		}
+
+		let Some(host) = request.headers().get(hyper::header::HOST) else {
+			return Ok(error_response(hyper::StatusCode::BAD_REQUEST));
+		};
+		let host = host.to_str().unwrap();
 		
 		let path = std::path::Path::new(request.uri().path());
 		if let &hyper::Method::GET = request.method() {
 			if let Some(parent) = path.parent().map(|parent| parent.as_os_str()).and_then(|parent| parent.to_str()) {
 				match parent {
 					"/audio" => {
-						if let Some("mp3") = path.extension().and_then(|extension| extension.to_str()) {
-							let video_id = path.file_stem().unwrap().to_str().unwrap();
+						let Some("mp3") = path.extension().and_then(|extension| extension.to_str()) else {
+							return Ok(error_response(hyper::StatusCode::NOT_FOUND));
+						};
 
-							let (response_sender, response_receiver) = oneshot::channel();
-							audio_cache_request_sender.send((
-								response_sender,
-								String::from(video_id),
-							)).unwrap();
-		
-							let cached_audio_file = response_receiver.await.unwrap();
+						let Some(video_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+							return Ok(error_response(hyper::StatusCode::NOT_FOUND));
+						};
 
-							if let Ok(mut cached_audio_file) = cached_audio_file {
-								let mut audio = Vec::new();
-								cached_audio_file.file_mut().read_to_end(&mut audio).unwrap();
-								anyhow::Ok(
-									hyper::Response::builder()
-										.header(hyper::header::CONTENT_TYPE, "audio/mp3")
-										.body(hyper::Body::from(audio))
-										.unwrap())
-							} else {
-								anyhow::Ok(error_response(hyper::StatusCode::INTERNAL_SERVER_ERROR))
-							}
+						let (response_sender, response_receiver) = oneshot::channel();
+						audio_cache_request_sender.send((
+							response_sender,
+							String::from(video_id),
+						)).unwrap();
+	
+						let cached_audio_file = response_receiver.await.unwrap();
+
+						if let Ok(mut cached_audio_file) = cached_audio_file {
+							let mut audio = Vec::new();
+							cached_audio_file.file_mut().read_to_end(&mut audio).unwrap();
+							anyhow::Ok(
+								hyper::Response::builder()
+									.header(hyper::header::CONTENT_TYPE, "audio/mp3")
+									.body(hyper::Body::from(audio))
+									.unwrap())
 						} else {
-							anyhow::Ok(error_response(hyper::StatusCode::NOT_FOUND))
+							anyhow::Ok(error_response(hyper::StatusCode::INTERNAL_SERVER_ERROR))
 						}
 					}
 					"/feed/channel_id" => {
-						let channel_id = path
-							.file_name().unwrap()
-							.to_str().unwrap()
-							.to_string();
+						let Some(channel_id) = path.file_name()
+							.and_then(|file_name| file_name.to_str())
+							.map(|file_name| file_name.to_string())
+						else {
+							return anyhow::Ok(error_response(hyper::StatusCode::NOT_FOUND));
+						};
+
 						let feed = get_feed(
-							config.clone(),
 							youtube_data_request_sender,
 							&crate::youtube_data::ChannelIdentifier::Id(channel_id),
+							host,
 						).await;
+
 						anyhow::Ok(
 							hyper::Response::builder()
 								.header(hyper::header::CONTENT_TYPE, "application/rss+xml; charset=utf-8")
@@ -288,15 +299,19 @@ mod web {
 						)
 					}
 					"/feed/channel_custom_url" => {
-						let channel_custom_url = path
-							.file_name().unwrap()
-							.to_str().unwrap()
-							.to_string();
+						let Some(channel_custom_url) = path.file_name()
+							.and_then(|file_name| file_name.to_str())
+							.map(|file_name| file_name.to_string())
+						else {
+							return anyhow::Ok(error_response(hyper::StatusCode::NOT_FOUND));
+						};
+
 						let feed = get_feed(
-							config.clone(),
 							youtube_data_request_sender,
 							&crate::youtube_data::ChannelIdentifier::CustomUrl(channel_custom_url),
+							host,
 						).await;
+
 						anyhow::Ok(
 							hyper::Response::builder()
 								.header(hyper::header::CONTENT_TYPE, "application/rss+xml; charset=utf-8")
@@ -538,16 +553,6 @@ mod youtube_data {
 			&channel_id,
 		)
 			.map(|_| channel_id)
-			.map_err(|err| match err {
-				Error::InvalidChannelId => {
-					if let ChannelIdentifier::CustomUrl(_) = channel_identifier {
-						Error::InvalidChannelCustomUrl
-					} else {
-						err
-					}
-				}
-				_ => err,
-			})
 	}
 	
 	fn update_channel_data_sync<T: AsRef<str>>(
