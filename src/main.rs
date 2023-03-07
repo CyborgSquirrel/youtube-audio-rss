@@ -538,7 +538,7 @@ mod youtube_data {
 						if let Some(channel_id) = channel_id {
 							channel_id
 						} else {
-							todo!()
+							return Err(Error::InvalidChannelCustomUrl);
 						}
 					}
 				}
