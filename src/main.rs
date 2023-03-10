@@ -392,7 +392,7 @@ mod youtube_data {
 			
 			CREATE TABLE IF NOT EXISTS Video
 				( id TEXT PRIMARY KEY
-				, channel_id TEXT 
+				, channel_id TEXT
 				
 				, name TEXT
 				, description TEXT
@@ -834,7 +834,7 @@ mod audio_cache {
 		audio_path
 	}
 	
-	// TODO: test to make sure that the reference-counting works correctly.
+	// TODO: Test to make sure that the reference-counting works correctly.
 	pub async fn server(
 		config: Arc<crate::Config>,
 		mut request_receiver: tokio::sync::mpsc::UnboundedReceiver<(tokio::sync::oneshot::Sender<Result<CachedAudioFile, ()>>, String)>,
@@ -882,186 +882,221 @@ mod audio_cache {
 			transaction.commit().unwrap();
 		}
 
-		let connection: Arc<Mutex<rusqlite::Connection>> = Arc::new(Mutex::new(connection));
+		let connection = Arc::new(Mutex::<rusqlite::Connection>::new(connection));
 
 		let (drop_sender, mut drop_receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
-		let audio_reference_count: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
-		let audio_available_notify: Arc<Mutex<HashMap<String, broadcast::Sender<bool>>>> = Arc::new(Mutex::new(HashMap::new()));
+		let audio_reference_count = Arc::new(Mutex::new(HashMap::<String, u32>::new()));
+		let audio_available_notify = Arc::new(Mutex::new(HashMap::<String, broadcast::Sender<bool>>::new()));
+		let (run_cleanup_sender, mut run_cleanup_receiver) = tokio::sync::mpsc::unbounded_channel::<()>();
 		
-		loop {
-			tokio::select! {
-				// NOTE: Make sure to always serve all audio requests, before handling the
-				// drops, so that we don't delete an audio file which was actually
-				// requested.
-			
-				biased;
+		let task_reference_counter = {
+			let audio_reference_count = audio_reference_count.clone();
+			let connection = connection.clone();
+			async move {
+				loop {
+					tokio::select! {
+						// NOTE: Make sure to always serve all audio requests, before handling the
+						// drops, so that we don't delete an audio file which was actually
+						// requested.
+		
+						biased;
 
-				request = request_receiver.recv() => {
-					let connection = connection.clone();
-					let audio_download_notify = audio_available_notify.clone();
-					let youtube_download_request_sender = audio_download_request_sender.clone();
-					let audio_reference_count = audio_reference_count.clone();
-					let drop_sender = drop_sender.clone();
-					tokio::spawn(async move {
-						let (response_sender, video_id) = request.unwrap();
+						request = request_receiver.recv() => {
+							let connection = connection.clone();
+							let audio_download_notify = audio_available_notify.clone();
+							let youtube_download_request_sender = audio_download_request_sender.clone();
+							let audio_reference_count = audio_reference_count.clone();
+							let drop_sender = drop_sender.clone();
+							let run_cleanup_sender = run_cleanup_sender.clone();
+							tokio::spawn(async move {
+								let (response_sender, video_id) = request.unwrap();
 
-						let audio_downloaded = {
-							connection.lock().await.query_row(
-								"SELECT EXISTS (SELECT 1 FROM Audio WHERE video_id = ?)",
-								rusqlite::params![video_id],
-								|row| row.get::<_, bool>(0),
-							).unwrap()
-						};
-					
-						let final_filename = format!("{}.mp3", &video_id);
-						let final_path = std::path::Path::new(".")
-							.join(AUDIO_CACHE_PATH.as_os_str())
-							.join(&final_filename);
-						
-						let mut update_last_accessed_timestamp = true;
-						let mut audio_available = true;
-						
-						if !audio_downloaded {
-							let mut audio_download_notify = audio_download_notify.lock().await;
-							if let Some(mut receiver) = audio_download_notify.get(&video_id).map(|sender| sender.subscribe()) {
-								std::mem::drop(audio_download_notify);
-								audio_available = receiver.recv().await.unwrap();
-							} else {
-								update_last_accessed_timestamp = false;
-							
-								let (broadcast_sender, _) = broadcast::channel(1);
-								audio_download_notify.insert(video_id.clone(), broadcast_sender.clone());
-								std::mem::drop(audio_download_notify);
-							
-								let (response_sender, response_receiver) = oneshot::channel();
-								youtube_download_request_sender.send((
-									response_sender,
-									video_id.clone(),
-								)).unwrap();
-							
-								match response_receiver.await.unwrap() {
-									Ok(response_path) => {
-										let metadata = std::fs::metadata(&response_path).unwrap();
-									
-										// NOTE: Audio should always be first added to the database, and only
-										// then moved to the directory, because in case the program is
-										// unexpectedely stopped, it will only delete database entries without
-										// corresponding audio files (and not audio files without
-										// corresponding database entries).
-							
-										// Add audio to database.
-										connection.lock().await.execute(
-											"INSERT INTO Audio (video_id, size, last_accessed_timestamp) VALUES (?, ?, ?)",
-											rusqlite::params![video_id, metadata.len(), chrono::Utc::now()],
-										).unwrap();
-
-										// Move audio to cache.
-										std::fs::rename(&response_path, &final_path).unwrap();
-									}
-									Err(err) => {
-										log::error!("failed to download youtube video audio {err:?}");
-										audio_available = false;
-									}
+								let audio_downloaded = {
+									connection.lock().await.query_row(
+										"SELECT EXISTS (SELECT 1 FROM Audio WHERE video_id = ?)",
+										rusqlite::params![video_id],
+										|row| row.get::<_, bool>(0),
+									).unwrap()
 								};
-							
-								// We don't care if there were any/no receivers for the broadcast.
-								let _ = broadcast_sender.send(audio_available);
-							}
-						}
+				
+								let final_filename = format!("{}.mp3", &video_id);
+								let final_path = std::path::Path::new(".")
+									.join(AUDIO_CACHE_PATH.as_os_str())
+									.join(&final_filename);
+					
+								let mut update_last_accessed_timestamp = true;
+								let mut audio_available = true;
+					
+								if !audio_downloaded {
+									let mut audio_download_notify = audio_download_notify.lock().await;
+									if let Some(mut receiver) = audio_download_notify.get(&video_id).map(|sender| sender.subscribe()) {
+										std::mem::drop(audio_download_notify);
+										audio_available = receiver.recv().await.unwrap();
+									} else {
+										update_last_accessed_timestamp = false;
 						
-						if !audio_available {
-							let _ = response_sender.send(Err(()));
-						} else {
-							if update_last_accessed_timestamp {
-								connection.lock().await.execute(
-									"UPDATE Audio SET last_accessed_timestamp = ? WHERE video_id = ?",
-									rusqlite::params![chrono::Utc::now(), video_id],
-								).unwrap();
-							}
+										let (broadcast_sender, _) = broadcast::channel(1);
+										audio_download_notify.insert(video_id.clone(), broadcast_sender.clone());
+										std::mem::drop(audio_download_notify);
 						
-							{
-								let mut audio_reference_count = audio_reference_count.lock().await;
-								// Inefficient entry api :(.
-								let references = audio_reference_count.entry(video_id.clone()).or_insert(0);
-								*references += 1;
-								std::mem::drop(audio_reference_count);
-							}
+										let (response_sender, response_receiver) = oneshot::channel();
+										youtube_download_request_sender.send((
+											response_sender,
+											video_id.clone(),
+										)).unwrap();
 						
-							let result = response_sender.send(
-								Ok(
-									CachedAudioFile {
-										file: std::fs::File::open(final_path).unwrap(),
-										drop_sender,
-										video_id})
-							);
+										match response_receiver.await.unwrap() {
+											Ok(response_path) => {
+												let metadata = std::fs::metadata(&response_path).unwrap();
+								
+												// NOTE: Audio should always be first added to the database, and only
+												// then moved to the directory, because in case the program is
+												// unexpectedely stopped, it will only delete database entries without
+												// corresponding audio files (and not audio files without
+												// corresponding database entries).
 						
-							if let Err(_) = result {
-								log::error!("couldn't send audio file");
-							}
-						}
-					});
-				}
+												// Add audio to database.
+												connection.lock().await.execute(
+													"INSERT INTO Audio (video_id, size, last_accessed_timestamp) VALUES (?, ?, ?)",
+													rusqlite::params![video_id, metadata.len(), chrono::Utc::now()],
+												).unwrap();
 
-				video_id = drop_receiver.recv() => {
-					let video_id = video_id.unwrap();
-					let mut audio_reference_count = audio_reference_count.lock().await;
-					let references = audio_reference_count.get_mut(&video_id).unwrap();
-					*references -= 1;
-					if *references == 0 {
-						audio_reference_count.remove(&video_id);
+												// Move audio to cache.
+												std::fs::rename(&response_path, &final_path).unwrap();
+										
+												// Don't check whether send was succesful or not.
+												let _ = run_cleanup_sender.send(());
+											}
+											Err(err) => {
+												log::error!("failed to download youtube video audio {err:?}");
+												audio_available = false;
+											}
+										};
+						
+										// We don't care if there were any/no receivers for the broadcast.
+										let _ = broadcast_sender.send(audio_available);
+									}
+								}
+					
+								if !audio_available {
+									let _ = response_sender.send(Err(()));
+								} else {
+									if update_last_accessed_timestamp {
+										connection.lock().await.execute(
+											"UPDATE Audio SET last_accessed_timestamp = ? WHERE video_id = ?",
+											rusqlite::params![chrono::Utc::now(), video_id],
+										).unwrap();
+									}
+					
+									{
+										let mut audio_reference_count = audio_reference_count.lock().await;
+										// Inefficient entry api :(.
+										let references = audio_reference_count.entry(video_id.clone()).or_insert(0);
+										*references += 1;
+										std::mem::drop(audio_reference_count);
+									}
+					
+									let result = response_sender.send(
+										Ok(
+											CachedAudioFile {
+												file: std::fs::File::open(final_path).unwrap(),
+												drop_sender,
+												video_id})
+									);
+					
+									if let Err(_) = result {
+										log::error!("couldn't send audio file");
+									}
+								}
+							});
+						}
+
+						video_id = drop_receiver.recv() => {
+							let video_id = video_id.unwrap();
+							let mut audio_reference_count = audio_reference_count.lock().await;
+							let references = audio_reference_count.get_mut(&video_id).unwrap();
+							*references -= 1;
+							if *references == 0 {
+								audio_reference_count.remove(&video_id);
+								// Don't check whether send was succesful or not.
+								let _ = run_cleanup_sender.send(());
+							}
+						}
 					}
 				}
 			}
-			
-			// Clean up cache.
-			#[derive(Debug)]
-			struct Audio {
-				video_id: String,
-				size: u64,
-			}
+		};
 		
-			let connection = connection.lock().await;
-			let mut audios: Vec<_> = {
-				let mut statement = connection.prepare(
-					"SELECT video_id, size FROM Audio ORDER BY last_accessed_timestamp"
-				).unwrap();
-
-				let rows = statement.query_map(
-					rusqlite::params![],
-					|row| Ok(
-						Audio {
-							video_id: row.get(0)?,
-							size: row.get(1)?}),
-				).unwrap();
-
-				let rows = rows.map(|row| row.unwrap()).collect();
-				std::mem::drop(statement);
-				rows
-			};
-			
-			let audio_reference_count = audio_reference_count.lock().await;
-			audios.retain(|audio| !audio_reference_count.contains_key(&audio.video_id));
-			
-			let mut audio_cache_size: u64 = audios.iter().map(|audio| audio.size).sum();
+		let task_cleanup = {
+			async move {
+				while let Some(()) = run_cleanup_receiver.recv().await {
+					// Clean up cache.
+					#[derive(Debug)]
+					struct Audio {
+						video_id: String,
+						size: u64,
+					}
 		
-			if audio_cache_size > config.audio_cache_size {
-				while !audios.is_empty()
-					&& audio_cache_size > config.audio_cache_size
-				{
-					let audio = audios.pop().unwrap();
-					let audio_path = video_id_to_audio_path(&audio.video_id);
-					audio_cache_size -= audio.size;
-					std::fs::remove_file(&audio_path).unwrap();
-					connection.execute(
-						"DELETE FROM Audio WHERE video_id = ?",
-						rusqlite::params![audio.video_id],
-					).unwrap();
+					let connection = connection.lock().await;
+					
+					// Audios sorted from least to most recently accessed.
+					let mut audios: Vec<_> = {
+						let mut statement = connection.prepare(
+							"SELECT video_id, size FROM Audio ORDER BY last_accessed_timestamp ASC"
+						).unwrap();
+
+						let rows = statement.query_map(
+							rusqlite::params![],
+							|row| Ok(
+								Audio {
+									video_id: row.get(0)?,
+									size: row.get(1)?}),
+						).unwrap();
+
+						let rows = rows.map(|row| row.unwrap()).collect();
+						std::mem::drop(statement);
+						rows
+					};
+					
+					// Don't clean up the cache if there's only one audio file, even if that
+					// file is over the limit.
+					if audios.len() <= 1 {
+						break;
+					}
+
+					let mut audio_cache_size: u64 = audios.iter().map(|audio| audio.size).sum();
+			
+					let audio_reference_count = audio_reference_count.lock().await;
+					// Audios which are not currently opened.
+					let unused_audios = {
+						audios.retain(|audio| !audio_reference_count.contains_key(&audio.video_id));
+						audios
+					};
+		
+					for unused_audio in unused_audios {
+						if !(audio_cache_size > config.audio_cache_size) {
+							break;
+						}
+
+						let audio_path = video_id_to_audio_path(&unused_audio.video_id);
+						audio_cache_size -= unused_audio.size;
+						std::fs::remove_file(&audio_path).unwrap();
+						connection.execute(
+							"DELETE FROM Audio WHERE video_id = ?",
+							rusqlite::params![unused_audio.video_id],
+						).unwrap();
+					}
+
+					std::mem::drop(connection);
+					std::mem::drop(audio_reference_count);
 				}
 			}
-			std::mem::drop(connection);
-
-			std::mem::drop(audio_reference_count);
-		}
+		};
+		
+		tokio::join! {
+			task_reference_counter,
+			task_cleanup,
+		};
 	}
 }
 
