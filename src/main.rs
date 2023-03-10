@@ -1134,12 +1134,15 @@ async fn main() {
 	let config: Config = {
 		let mut file = std::fs::File::open(&args.config_path).unwrap();
 		let mut contents = String::new();
-		file.read_to_string(&mut contents).unwrap();
-		toml::from_str(&contents).unwrap()
+		file.read_to_string(&mut contents)
+			.expect("Could not read config file.");
+		toml::from_str(&contents)
+			.expect("Could not parse config file.")
 	};
 	let config = Arc::new(config);
 	
-	let youtube_secret = google_youtube3::oauth2::read_service_account_key(&config.youtube_secret_path).await.unwrap();
+	let youtube_secret = google_youtube3::oauth2::read_service_account_key(&config.youtube_secret_path).await
+		.expect("Could not open youtube secret.");
 	
 	if !config.working_dir.exists() {
 		std::fs::create_dir_all(&config.working_dir).unwrap();
