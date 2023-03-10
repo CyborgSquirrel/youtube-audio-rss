@@ -1,5 +1,5 @@
 {
-  description = "youtube-audio-rss flake";
+  description = "youtube-channel-podcast flake";
   
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-22.11";
@@ -26,7 +26,7 @@
         };
       in rec {
         packages.default = pkgs.rustPlatform.buildRustPackage rec {
-          name = "youtube-audio-rss";
+          name = "youtube-channel-podcast";
           version = "0.1.0";
           src = ./.;
           cargoLock = {
@@ -45,7 +45,7 @@
           ];
           LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath buildInputs}";
           postFixup = ''
-            wrapProgram $out/bin/youtube-audio-rss \
+            wrapProgram $out/bin/youtube-channel-podcast \
               --set PATH ${pkgs.lib.makeBinPath [
                 pkgs.yt-dlp
                 pkgs.aria2
@@ -53,9 +53,9 @@
           '';
         };
         nixosModules.default = { config, lib, pkgs, ... }: let
-          cfg = config.services.youtube-audio-rss;
+          cfg = config.services.youtube-channel-podcast;
         in {
-          options.services.youtube-audio-rss = {
+          options.services.youtube-channel-podcast = {
             enable = lib.mkOption {
               type = lib.types.bool;
               default = false;
@@ -82,7 +82,7 @@
             };
           };
           config = {
-            systemd.services.youtube-audio-rss = lib.mkIf cfg.enable {
+            systemd.services.youtube-channel-podcast = lib.mkIf cfg.enable {
               description = "Convert youtube channels to podcasts.";
               wantedBy = [ "multi-user.target" ];
               serviceConfig = let
@@ -98,7 +98,7 @@
           };
         };
         devShell = pkgs.mkShell rec {
-          name = "youtube-audio-rss";
+          name = "youtube-channel-podcast";
           buildInputs = [
             pkgs.openssl
             pkgs.openssl.dev
