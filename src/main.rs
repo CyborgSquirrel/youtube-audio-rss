@@ -536,16 +536,21 @@ mod youtube_data {
 							.build()
 							.unwrap();
 						
+						// TODO: Do something about this get failling.
 						let response = client.get(uri).await.unwrap();
 						let (_head, body) = response.into_parts();
 						let bytes = hyper::body::to_bytes(body).await.unwrap();
 						let text = std::str::from_utf8(&bytes).unwrap();
 						
-						// TODO: check for this not working
+						lazy_static::lazy_static! {
+							static ref channel_id_regex: regex::Regex = {
+								let regex_source = r#"<link rel="alternate" type="application/rss[+]xml" title="RSS" href="https://www[.]youtube[.]com/feeds/videos[.]xml[?]channel_id=([^"]*)">"#;
+								let regex = regex::RegexBuilder::new(regex_source).build().unwrap();
+								regex
+							};
+						}
 						
-						let regex_source = r#"<link rel="alternate" type="application/rss[+]xml" title="RSS" href="https://www[.]youtube[.]com/feeds/videos[.]xml[?]channel_id=([^"]*)">"#;
-						let regex = regex::RegexBuilder::new(regex_source).build().unwrap();
-						let channel_id = regex.captures(text).map(|capture| capture.get(1).unwrap().as_str().to_string());
+						let channel_id = channel_id_regex.captures(text).map(|capture| capture.get(1).unwrap().as_str().to_string());
 						
 						if let Some(channel_id) = channel_id {
 							channel_id
