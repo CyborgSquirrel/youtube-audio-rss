@@ -482,7 +482,11 @@ mod youtube_data {
 					videos,
 				};
 
-				sender.send(channel).unwrap();
+				let result = sender.send(channel);
+				
+				if let Err(_) = result {
+					log::info!("couldn't send channel data");
+				}
 			});
 		}
 	}
@@ -1005,7 +1009,7 @@ mod audio_cache {
 									);
 					
 									if let Err(_) = result {
-										log::error!("couldn't send audio file");
+										log::info!("couldn't send audio file");
 									}
 								}
 							});
