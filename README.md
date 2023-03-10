@@ -78,7 +78,9 @@ youtube_update_delay = "15m"
 url_scheme = "http"
 
 # a prefix which will be added to the audio urls in the generated rss feed
+url_path_prefix = ""
+
 # NOTE: you may want to use this, if you're trying to run this service behind a
 # reverse proxy
-url_path_prefix = "/youtube_channel_podcast"
+# url_path_prefix = "/youtube_channel_podcast"
 ```
