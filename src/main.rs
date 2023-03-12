@@ -897,7 +897,7 @@ mod audio_cache {
 		let audio_reference_count = Arc::new(Mutex::new(HashMap::<String, u32>::new()));
 		let audio_available_notify = Arc::new(Mutex::new(HashMap::<String, broadcast::Sender<bool>>::new()));
 		let (run_cleanup_sender, mut run_cleanup_receiver) = tokio::sync::mpsc::unbounded_channel::<()>();
-		
+
 		let task_reference_counter = {
 			let audio_reference_count = audio_reference_count.clone();
 			let connection = connection.clone();
@@ -986,6 +986,10 @@ mod audio_cache {
 										let _ = broadcast_sender.send(audio_available);
 									}
 								}
+
+								// TODO: I'm pretty sure that a file that has just been downloaded could
+								// technically get cleaned up by the cache at this point. Find a way to
+								// prevent that.
 					
 								if !audio_available {
 									let _ = response_sender.send(Err(()));
